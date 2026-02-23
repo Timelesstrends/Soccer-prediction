@@ -1,0 +1,51 @@
+# render.yaml — tells Render exactly how to build and run the app.
+# Commit this file to the root of your GitHub repo.
+# Render detects it automatically when you connect the repo.
+
+services:
+  - type: web
+    name: soccer-predictions
+    runtime: python
+    region: frankfurt          # change to: oregon, ohio, singapore, virginia
+    plan: free
+
+    # ── Build ──────────────────────────────────────────────────────────────
+    buildCommand: pip install -r requirements.txt
+
+    # ── Start (gunicorn replaces Flask dev server) ─────────────────────────
+    # --workers 2        → 2 parallel worker processes
+    # --threads 2        → 2 threads per worker (handles scheduler + requests)
+    # --timeout 120      → allow 2 min for initial API fetch on startup
+    # --bind 0.0.0.0:$PORT → Render injects $PORT automatically
+    startCommand: >
+      gunicorn "server:create_app()"
+      --workers 2
+      --threads 2
+      --timeout 120
+      --bind 0.0.0.0:$PORT
+      --log-level info
+      --access-logfile -
+      --error-logfile -
+
+    # ── Health check ───────────────────────────────────────────────────────
+    # Render pings /health every 30s. If it fails, the app is restarted.
+    healthCheckPath: /health
+
+    # ── Environment variables ──────────────────────────────────────────────
+    # Set these in the Render dashboard under Environment → Secret Files.
+    # DO NOT hardcode real values here — this file is committed to Git.
+    envVars:
+      - key: LIVE_MODE
+        value: "true"                  # enables real API fetching
+
+      - key: FOOTBALL_DATA_KEY
+        sync: false                    # Render will prompt you to enter the value
+
+      - key: ODDS_API_KEY
+        sync: false                    # Render will prompt you to enter the value
+
+      - key: DASHBOARD_PASSWORD
+        sync: false                    # password to access the dashboard
+
+      - key: PYTHON_VERSION
+        value: "3.12"
