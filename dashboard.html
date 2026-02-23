@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Soccer Prediction Dashboard</title>
+    <style>
+        :root {
+            --bg-dark: #0f172a;
+            --bg-card: #1e293b;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --accent-green: #10b981;
+            --accent-yellow: #f59e0b;
+            --accent-red: #ef4444;
+            --accent-blue: #3b82f6;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 2rem;
+            text-align: center;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3);
+        }
+
+        .header h1 { font-size: 2.5rem; margin-bottom: 0.5rem; }
+        .header p  { color: rgba(255,255,255,0.9); font-size: 1.1rem; }
+
+        .container { max-width: 1400px; margin: 0 auto; padding: 2rem; }
+
+        /* ── Stats grid ── */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 3rem;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            padding: 1.5rem;
+            border-radius: 12px;
+            border-left: 4px solid var(--accent-blue);
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.2);
+        }
+
+        .stat-card h3 {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-value { font-size: 2rem; font-weight: bold; }
+
+        /* ── Match cards ── */
+        .matches-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .match-card {
+            background: var(--bg-card);
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.3);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .match-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 20px 25px -5px rgba(0,0,0,0.4);
+        }
+
+        .confidence-high   { border-top: 4px solid var(--accent-green); }
+        .confidence-medium { border-top: 4px solid var(--accent-yellow); }
+        .confidence-low    { border-top: 4px solid var(--accent-red); }
+
+        .match-header {
+            background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+            padding: 1.5rem;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .teams {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+
+        .vs  { color: var(--text-secondary); font-size: 0.875rem; margin: 0 1rem; }
+        .meta { color: var(--text-secondary); font-size: 0.875rem; margin-top: 0.5rem; }
+
+        .match-body { padding: 1.5rem; }
+
+        .prediction-main { text-align: center; margin-bottom: 1.5rem; }
+
+        .goal-prediction {
+            font-size: 3rem;
+            font-weight: bold;
+            background: linear-gradient(135deg, var(--accent-green), #059669);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .prediction-sub { color: var(--text-secondary); }
+
+        /* ── Probability bars ── */
+        .probability-bars { margin: 1rem 0; }
+
+        .prob-row {
+            display: flex;
+            align-items: center;
+            margin-bottom: 0.75rem;
+        }
+
+        .prob-label { width: 100px; font-size: 0.875rem; color: var(--text-secondary); }
+
+        .prob-bar-bg {
+            flex: 1;
+            height: 24px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 12px;
+            overflow: hidden;
+            margin: 0 1rem;
+        }
+
+        .prob-bar-fill {
+            height: 100%;
+            border-radius: 12px;
+            animation: growBar 0.6s ease forwards;
+        }
+
+        @keyframes growBar { from { width: 0; } }
+
+        .over-fill  { background: linear-gradient(90deg, var(--accent-green), #059669); }
+        .under-fill { background: linear-gradient(90deg, var(--accent-blue), #2563eb); }
+
+        .prob-value { width: 50px; text-align: right; font-weight: 600; }
+
+        /* ── Form section ── */
+        .form-section {
+            margin: 1.25rem 0;
+            padding: 0.875rem 1rem;
+            background: rgba(255,255,255,0.04);
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.07);
+        }
+
+        .form-title {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-secondary);
+            margin-bottom: 0.6rem;
+        }
+
+        .form-row {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .form-row:last-child { margin-bottom: 0; }
+
+        .form-team {
+            font-size: 0.8rem;
+            font-weight: 600;
+            min-width: 120px;
+            color: var(--text-primary);
+        }
+
+        .form-badges {
+            display: flex;
+            gap: 4px;
+        }
+
+        .form-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 24px;
+            height: 24px;
+            border-radius: 5px;
+            font-size: 0.75rem;
+            font-weight: 700;
+        }
+
+        .form-W { background: rgba(16,185,129,0.25);  color: var(--accent-green); border: 1px solid var(--accent-green); }
+        .form-D { background: rgba(245,158,11,0.20);  color: var(--accent-yellow); border: 1px solid var(--accent-yellow); }
+        .form-L { background: rgba(239,68,68,0.20);   color: var(--accent-red);   border: 1px solid var(--accent-red); }
+
+        .form-stats {
+            font-size: 0.72rem;
+            color: var(--text-secondary);
+            margin-left: auto;
+        }
+
+        .momentum-bar-wrap {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 2px;
+        }
+
+        .momentum-bar-bg {
+            flex: 1;
+            height: 4px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 2px;
+            overflow: hidden;
+            max-width: 80px;
+        }
+
+        .momentum-bar-fill {
+            height: 100%;
+            border-radius: 2px;
+            background: linear-gradient(90deg, var(--accent-yellow), var(--accent-green));
+        }
+
+        .momentum-label { font-size: 0.7rem; color: var(--text-secondary); }
+
+        /* ── Goal distribution histogram ── */
+        .distribution { margin-top: 1rem; }
+        .dist-title { font-size: 0.875rem; color: var(--text-secondary); margin-bottom: 0.5rem; }
+
+        .dist-bars {
+            display: flex;
+            gap: 4px;
+            height: 60px;
+            align-items: flex-end;
+        }
+
+        .dist-bar {
+            flex: 1;
+            background: linear-gradient(to top, var(--accent-blue), #60a5fa);
+            border-radius: 4px 4px 0 0;
+            position: relative;
+            min-height: 2px;
+            transition: opacity 0.2s;
+        }
+
+        .dist-bar:hover { opacity: 0.8; }
+
+        .dist-label {
+            position: absolute;
+            bottom: -20px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .dist-value {
+            position: absolute;
+            top: -20px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        /* ── Value bet badge ── */
+        .value-badge {
+            display: inline-block;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            margin-top: 1rem;
+        }
+
+        .value-yes {
+            background: rgba(16,185,129,0.2);
+            color: var(--accent-green);
+            border: 1px solid var(--accent-green);
+        }
+
+        .value-no {
+            background: rgba(148,163,184,0.1);
+            color: var(--text-secondary);
+        }
+
+        /* ── Footer ── */
+        .timestamp {
+            text-align: center;
+            color: var(--text-secondary);
+            margin-top: 3rem;
+            padding-top: 2rem;
+            border-top: 1px solid rgba(255,255,255,0.1);
+        }
+
+        @media (max-width: 768px) {
+            .matches-grid { grid-template-columns: 1fr; }
+            .teams { flex-direction: column; text-align: center; }
+            .vs { margin: 0.5rem 0; }
+            .form-row { flex-direction: column; align-items: flex-start; }
+            .form-stats { margin-left: 0; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>⚽ Soccer Goal Predictions</h1>
+        <p>Machine Learning Powered Match Analysis</p>
+    </div>
+
+    <div class="container">
+
+        <!-- Summary stats -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>Total Matches</h3>
+                <div class="stat-value">{{ stats.total }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>High Confidence</h3>
+                <div class="stat-value" style="color: var(--accent-green);">{{ stats.high_confidence }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Avg Predicted Goals</h3>
+                <div class="stat-value" style="color: var(--accent-blue);">{{ "%.2f"|format(stats.avg_goals) }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Value Opportunities</h3>
+                <div class="stat-value" style="color: var(--accent-yellow);">{{ stats.value_bets }}</div>
+            </div>
+        </div>
+
+        <!-- Match cards -->
+        <div class="matches-grid">
+            {% for pred in predictions %}
+            <div class="match-card confidence-{{ pred.confidence.value }}">
+
+                <div class="match-header">
+                    <div class="teams">
+                        <span>{{ pred.home_team }}</span>
+                        <span class="vs">VS</span>
+                        <span>{{ pred.away_team }}</span>
+                    </div>
+                    <div class="meta">{{ pred.league }} | {{ pred.date }}</div>
+                </div>
+
+                <div class="match-body">
+
+                    <!-- Predicted goals -->
+                    <div class="prediction-main">
+                        <div class="goal-prediction">{{ "%.1f"|format(pred.predicted_goals) }}</div>
+                        <div class="prediction-sub">Predicted Total Goals</div>
+                    </div>
+
+                    <!-- Over / Under bars -->
+                    <div class="probability-bars">
+                        <div class="prob-row">
+                            <div class="prob-label">Over {{ goal_threshold }}</div>
+                            <div class="prob-bar-bg">
+                                <div class="prob-bar-fill over-fill"
+                                     style="width: {{ (pred.over_prob * 100)|round|int }}%"></div>
+                            </div>
+                            <div class="prob-value">{{ "%.0f%%"|format(pred.over_prob * 100) }}</div>
+                        </div>
+                        <div class="prob-row">
+                            <div class="prob-label">Under {{ goal_threshold }}</div>
+                            <div class="prob-bar-bg">
+                                <div class="prob-bar-fill under-fill"
+                                     style="width: {{ (pred.under_prob * 100)|round|int }}%"></div>
+                            </div>
+                            <div class="prob-value">{{ "%.0f%%"|format(pred.under_prob * 100) }}</div>
+                        </div>
+                    </div>
+
+                    <!-- Last N games form -->
+                    {% if pred.home_form or pred.away_form %}
+                    <div class="form-section">
+                        <div class="form-title">Last {{ form_window }} Games</div>
+
+                        {% for form in [pred.home_form, pred.away_form] if form %}
+                        <div class="form-row">
+                            <div class="form-team">{{ form.team_name }}</div>
+
+                            <div class="form-badges">
+                                {% for result in form.results %}
+                                <span class="form-badge form-{{ result }}">{{ result }}</span>
+                                {% endfor %}
+                            </div>
+
+                            <div class="form-stats">
+                                GF:{{ form.avg_scored }}
+                                GA:{{ form.avg_conceded }}
+                                &nbsp;·&nbsp;
+                                <span class="momentum-label">Momentum</span>
+                                {{ "%.0f%%"|format(form.momentum * 100) }}
+                                <div class="momentum-bar-wrap">
+                                    <div class="momentum-bar-bg">
+                                        <div class="momentum-bar-fill"
+                                             style="width: {{ (form.momentum * 100)|round|int }}%">
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% endif %}
+
+                    <!-- Goal distribution -->
+                    <div class="distribution">
+                        <div class="dist-title">Goal Distribution</div>
+                        <div class="dist-bars">
+                            {% for goal_count, prob in pred.goal_distribution_items %}
+                            <div class="dist-bar" style="height: {{ [prob * 100, 2]|max }}%">
+                                <div class="dist-value">{{ "%.0f%%"|format(prob * 100) }}</div>
+                                <div class="dist-label">{{ goal_count }}</div>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+
+                    <!-- Value bet -->
+                    {% if pred.value_bet %}
+                    <div class="value-badge value-yes">
+                        💰 VALUE BET | Edge: {{ "%.1f%%"|format(pred.value_bet.edge * 100) }}
+                        | Stake: {{ "%.1f%%"|format(pred.value_bet.kelly_stake) }}
+                    </div>
+                    {% else %}
+                    <div class="value-badge value-no">No Value Detected</div>
+                    {% endif %}
+
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="timestamp">
+            Generated on {{ generated_at }} | {{ form_window }}-game form considered | Stacked Ensemble Architecture
+        </div>
+    </div>
+</body>
+</html>
