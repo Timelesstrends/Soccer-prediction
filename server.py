@@ -163,6 +163,11 @@ def _register_routes(app: Flask) -> None:
             count = len(_predictions)
         return jsonify({"status": "ok", "predictions_loaded": count})
 
+    @app.route("/favicon.ico")
+    def favicon() -> Response:
+        """Prevent 404 log noise from browser favicon requests."""
+        return Response(status=204)
+
     @app.route("/health")
     def health() -> Response:
         """
@@ -806,149 +811,153 @@ HTML_TEMPLATE = """
 
 <script>
     var REFRESH_INTERVAL_MS = 30000;
+    var _renderQueue = [];
+    var _renderTimer = null;
 
-    // ── Fetch predictions from the API endpoint ────────────────────────────
+    // ── Fetch ─────────────────────────────────────────────────────────────
     function fetchPredictions() {
         fetch('/api/predictions')
             .then(function(res) { return res.json(); })
             .then(function(data) {
-                try {
-                    render(data);
-                } catch(renderErr) {
-                    document.getElementById('last-updated').textContent =
-                        'Render error: ' + renderErr.message;
-                    console.error('Render error:', renderErr);
+                try { render(data); }
+                catch(e) {
+                    document.getElementById('last-updated').textContent = 'Error: ' + e.message;
+                    console.error('render error', e);
                 }
             })
-            .catch(function(err) {
-                document.getElementById('last-updated').textContent =
-                    'Fetch error: ' + err.message;
-                console.error('Fetch failed:', err);
+            .catch(function(e) {
+                document.getElementById('last-updated').textContent = 'Fetch failed: ' + e.message;
+                console.error('fetch error', e);
             });
     }
 
-    // ── Render helpers ────────────────────────────────────────────────────
+    // ── Top-level render ──────────────────────────────────────────────────
     function render(data) {
         renderStats(data.stats);
-        // Render cards in batches so the browser doesn't freeze on 100+ cards
-        renderMatchesBatched(data.predictions);
-        document.getElementById('last-updated').textContent =
-            'Updated ' + data.last_updated;
+        document.getElementById('last-updated').textContent = 'Updated ' + data.last_updated;
         document.getElementById('footer').textContent =
-            'Auto-refreshes every 30s · ' + data.stats.total + ' matches loaded';
+            'Auto-refreshes every 30s - ' + data.stats.total + ' matches loaded';
+        renderMatchesQueued(data.predictions);
     }
 
     function renderStats(stats) {
-        document.getElementById('stats-grid').innerHTML =
-            '<div class="stat-card"><h3>Matches</h3><div class="stat-value">' + stats.total + '</div></div>' +
-            '<div class="stat-card"><h3>High Confidence</h3><div class="stat-value" style="color:var(--accent-green)">' + stats.high_confidence + '</div></div>' +
-            '<div class="stat-card"><h3>Avg Goals</h3><div class="stat-value" style="color:var(--accent-blue)">' + stats.avg_goals.toFixed(2) + '</div></div>' +
-            '<div class="stat-card"><h3>Value Bets</h3><div class="stat-value" style="color:var(--accent-yellow)">' + stats.value_bets + '</div></div>';
+        var h = '';
+        h += '<div class="stat-card"><h3>Matches</h3><div class="stat-value">' + stats.total + '</div></div>';
+        h += '<div class="stat-card"><h3>High Confidence</h3><div class="stat-value" style="color:var(--accent-green)">' + stats.high_confidence + '</div></div>';
+        h += '<div class="stat-card"><h3>Avg Goals</h3><div class="stat-value" style="color:var(--accent-blue)">' + stats.avg_goals.toFixed(2) + '</div></div>';
+        h += '<div class="stat-card"><h3>Value Bets</h3><div class="stat-value" style="color:var(--accent-yellow)">' + stats.value_bets + '</div></div>';
+        document.getElementById('stats-grid').innerHTML = h;
     }
 
-    function renderMatchesBatched(predictions) {
-        // Render first 10 immediately, then add the rest in chunks
-        // so the phone browser doesn't block for 2+ seconds on 100 cards
+    // ── Batched rendering (no nested functions, no recursion) ─────────────
+    function renderMatchesQueued(predictions) {
         var grid = document.getElementById('matches-grid');
         grid.innerHTML = '';
-        var BATCH = 10;
-        var idx = 0;
-        function renderBatch() {
-            var slice = predictions.slice(idx, idx + BATCH);
-            slice.forEach(function(p) {
-                var div = document.createElement('div');
-                try {
-                    div.innerHTML = matchCard(p);
-                    grid.appendChild(div.firstChild);
-                } catch(e) {
-                    console.error('Card error for', p.home_team, e);
+        _renderQueue = predictions.slice(); // copy array
+        if (_renderTimer) { clearInterval(_renderTimer); }
+        _renderTimer = setInterval(renderNextBatch, 50);
+    }
+
+    function renderNextBatch() {
+        if (_renderQueue.length === 0) {
+            clearInterval(_renderTimer);
+            _renderTimer = null;
+            return;
+        }
+        var grid = document.getElementById('matches-grid');
+        var batch = _renderQueue.splice(0, 8); // take 8, remove from front
+        var i;
+        for (i = 0; i < batch.length; i++) {
+            try {
+                var wrapper = document.createElement('div');
+                wrapper.innerHTML = buildCard(batch[i]);
+                if (wrapper.firstChild) {
+                    grid.appendChild(wrapper.firstChild);
                 }
-            });
-            idx += BATCH;
-            if (idx < predictions.length) {
-                setTimeout(renderBatch, 0); // yield to browser between batches
+            } catch(e) {
+                console.error('card error', e);
             }
         }
-        renderBatch();
     }
 
-    // formRow defined at module scope — avoids mobile browser strict-mode scoping bugs
-    function formRow(form) {
-        if (!form) return "";
-        var badges = form.results.map(function(r) {
-            var cls = r === "W" ? "form-W" : r === "D" ? "form-D" : "form-L";
-            return "<span class=\"form-badge " + cls + "\">" + r + "</span>";
-        }).join("");
+    // ── Form row ──────────────────────────────────────────────────────────
+    function buildFormRow(form) {
+        if (!form) { return ''; }
+        var i, r, cls, badges = '';
+        for (i = 0; i < form.results.length; i++) {
+            r = form.results[i];
+            cls = (r === 'W') ? 'form-W' : (r === 'D') ? 'form-D' : 'form-L';
+            badges += '<span class="form-badge ' + cls + '">' + r + '</span>';
+        }
         var momentum = (form.momentum * 100).toFixed(0);
-        return "<div class=\"form-row\">" +
-            "<div class=\"form-team\">" + form.team_name + "</div>" +
-            "<div class=\"form-badges\">" + badges + "</div>" +
-            "<div class=\"form-stats\">GF:" + form.avg_scored +
-            " GA:" + form.avg_conceded +
-            " &nbsp;&middot;&nbsp; Momentum: " + momentum + "%" +
-            "<div class=\"momentum-bar-wrap\"><div class=\"momentum-bar-bg\">" +
-            "<div class=\"momentum-bar-fill\" style=\"width:" + momentum + "%\"></div>" +
-            "</div></div></div></div>";
+        return '<div class="form-row">' +
+            '<div class="form-team">' + form.team_name + '</div>' +
+            '<div class="form-badges">' + badges + '</div>' +
+            '<div class="form-stats">GF:' + form.avg_scored +
+            ' GA:' + form.avg_conceded +
+            ' - Momentum: ' + momentum + '%' +
+            '<div class="momentum-bar-wrap"><div class="momentum-bar-bg">' +
+            '<div class="momentum-bar-fill" style="width:' + momentum + '%"></div>' +
+            '</div></div></div></div>';
     }
 
-    function matchCard(p) {
-        // Distribution bars
-        var distBars = p.goal_distribution_items.map(function(item) {
-            var h = Math.max(item[1] * 100, 2);
-            return "<div class=\"dist-bar\" style=\"height:" + h + "%\" data-prob=\"" + (item[1]*100).toFixed(1) + "%\"></div>";
-        }).join("");
+    // ── Match card ────────────────────────────────────────────────────────
+    function buildCard(p) {
+        var i, distBars = '', distLabels = '';
+        for (i = 0; i < p.goal_distribution_items.length; i++) {
+            var goals = p.goal_distribution_items[i][0];
+            var prob  = p.goal_distribution_items[i][1];
+            var h = prob * 100;
+            if (h < 2) { h = 2; }
+            distBars   += '<div class="dist-bar" style="height:' + h + '%" data-prob="' + (prob*100).toFixed(1) + '%"></div>';
+            distLabels += '<div class="dist-label-item">' + goals + '</div>';
+        }
 
-        var distLabels = p.goal_distribution_items.map(function(item) {
-            return "<div class=\"dist-label-item\">" + item[0] + "</div>";
-        }).join("");
+        var formHtml = '';
+        if (p.home_form || p.away_form) {
+            formHtml = '<div class="form-section"><div class="form-title">Last 5 Games</div>' +
+                buildFormRow(p.home_form) + buildFormRow(p.away_form) + '</div>';
+        }
 
-        // Form section
-        var formSection = (p.home_form || p.away_form)
-            ? "<div class=\"form-section\"><div class=\"form-title\">Last 5 Games</div>" +
-              formRow(p.home_form) + formRow(p.away_form) + "</div>"
-            : "";
-
-        // Value badge — no backticks for Huawei browser compatibility
         var badge = p.value_bet
-            ? "<div class=\"value-badge value-yes\"> VALUE BET: " +
+            ? '<div class="value-badge value-yes">VALUE BET: ' +
               p.value_bet.recommendation +
-              " &nbsp;|&nbsp; Edge: " + (p.value_bet.edge*100).toFixed(1) + "%" +
-              " &nbsp;|&nbsp; Stake: " + p.value_bet.kelly_stake.toFixed(1) + "%" +
-              "</div>"
-            : "<div class=\"value-badge value-no\">No Value Detected</div>";
+              ' - Edge: ' + (p.value_bet.edge * 100).toFixed(1) + '%' +
+              ' - Stake: ' + p.value_bet.kelly_stake.toFixed(1) + '%</div>'
+            : '<div class="value-badge value-no">No Value Detected</div>';
 
-        return "<div class=\"match-card confidence-" + p.confidence + "\">" +
-            "<div class=\"match-header\">" +
-                "<div class=\"teams\">" +
-                    "<span>" + p.home_team + "</span>" +
-                    "<span class=\"vs\">VS</span>" +
-                    "<span>" + p.away_team + "</span>" +
-                "</div>" +
-                "<div class=\"meta\">" + p.league + " &nbsp;&middot;&nbsp; " + p.date + "</div>" +
-            "</div>" +
-            "<div class=\"match-body\">" +
-                "<div class=\"goal-prediction\">" + p.predicted_goals.toFixed(1) + "</div>" +
-                "<div class=\"prediction-sub\">Predicted Total Goals</div>" +
-                "<div class=\"prob-row\">" +
-                    "<div class=\"prob-label\">Over 2.5</div>" +
-                    "<div class=\"prob-bar-bg\"><div class=\"prob-bar-fill over-fill\" style=\"width:" + (p.over_prob*100).toFixed(0) + "%\"></div></div>" +
-                    "<div class=\"prob-value\">" + (p.over_prob*100).toFixed(0) + "%</div>" +
-                "</div>" +
-                "<div class=\"prob-row\">" +
-                    "<div class=\"prob-label\">Under 2.5</div>" +
-                    "<div class=\"prob-bar-bg\"><div class=\"prob-bar-fill under-fill\" style=\"width:" + (p.under_prob*100).toFixed(0) + "%\"></div></div>" +
-                    "<div class=\"prob-value\">" + (p.under_prob*100).toFixed(0) + "%</div>" +
-                "</div>" +
-                formSection +
-                "<div class=\"dist-title\">Goal Distribution</div>" +
-                "<div class=\"dist-bars\">" + distBars + "</div>" +
-                "<div class=\"dist-label-row\">" + distLabels + "</div>" +
+        return '<div class="match-card confidence-' + p.confidence + '">' +
+            '<div class="match-header">' +
+                '<div class="teams">' +
+                    '<span>' + p.home_team + '</span>' +
+                    '<span class="vs">VS</span>' +
+                    '<span>' + p.away_team + '</span>' +
+                '</div>' +
+                '<div class="meta">' + p.league + ' - ' + p.date + '</div>' +
+            '</div>' +
+            '<div class="match-body">' +
+                '<div class="goal-prediction">' + p.predicted_goals.toFixed(1) + '</div>' +
+                '<div class="prediction-sub">Predicted Total Goals</div>' +
+                '<div class="prob-row">' +
+                    '<div class="prob-label">Over 2.5</div>' +
+                    '<div class="prob-bar-bg"><div class="prob-bar-fill over-fill" style="width:' + (p.over_prob*100).toFixed(0) + '%"></div></div>' +
+                    '<div class="prob-value">' + (p.over_prob*100).toFixed(0) + '%</div>' +
+                '</div>' +
+                '<div class="prob-row">' +
+                    '<div class="prob-label">Under 2.5</div>' +
+                    '<div class="prob-bar-bg"><div class="prob-bar-fill under-fill" style="width:' + (p.under_prob*100).toFixed(0) + '%"></div></div>' +
+                    '<div class="prob-value">' + (p.under_prob*100).toFixed(0) + '%</div>' +
+                '</div>' +
+                formHtml +
+                '<div class="dist-title">Goal Distribution</div>' +
+                '<div class="dist-bars">' + distBars + '</div>' +
+                '<div class="dist-label-row">' + distLabels + '</div>' +
                 badge +
-            "</div>" +
-        "</div>";
+            '</div>' +
+        '</div>';
     }
 
-    // ── Bootstrap ─────────────────────────────────────────────────────────
+    // ── Start ─────────────────────────────────────────────────────────────
     fetchPredictions();
     setInterval(fetchPredictions, REFRESH_INTERVAL_MS);
 </script>
