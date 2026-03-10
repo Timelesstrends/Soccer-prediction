@@ -27,6 +27,7 @@ GOAL_THRESHOLD: float = 2.5
 MAX_DISTRIBUTION_GOALS: int = 7
 CONSOLE_BAR_WIDTH: int = 30
 FORM_WINDOW: int = 5                          # number of recent games to consider
+H2H_WINDOW: int = 10                          # number of H2H games to consider
 TEMPLATE_DIR: Path = Path(__file__).parent / "templates"
 
 
@@ -96,7 +97,7 @@ class TeamForm:
     def momentum(self) -> float:
         """
         Weighted form rating — recent games count more than older ones.
-        Weights: oldest=1, …, newest=N.
+        Weights: oldest=1, …, newest=N (exponential-style linear ramp).
         Returns a value between 0.0 and 1.0.
         """
         if not self.results:
@@ -113,6 +114,92 @@ class TeamForm:
         return " ".join(self.results)
 
 
+@dataclass(frozen=True)
+class HomeAwaySplit:
+    """
+    A team's record split by home or away games only.
+    Used to capture teams that are dominant at home but weak away (or vice versa).
+    """
+    team_name: str
+    venue: str              # 'home' or 'away'
+    played: int
+    wins: int
+    draws: int
+    losses: int
+    goals_for: int
+    goals_against: int
+
+    @property
+    def avg_scored(self) -> float:
+        return round(self.goals_for / max(self.played, 1), 3)
+
+    @property
+    def avg_conceded(self) -> float:
+        return round(self.goals_against / max(self.played, 1), 3)
+
+    @property
+    def xg_estimate(self) -> float:
+        """
+        Simple xG estimate from home/away split.
+        Returns goals scored per game at this venue, floored at 0.3.
+        """
+        return max(self.avg_scored, 0.3)
+
+    @property
+    def strength_rating(self) -> float:
+        """
+        Venue-specific strength between 0.5 and 2.0.
+        Based on goals-for / goals-against ratio at this venue.
+        """
+        ratio = self.goals_for / max(self.goals_against, 0.5 * max(self.played, 1))
+        return round(min(max(ratio, 0.5), 2.0), 3)
+
+
+@dataclass(frozen=True)
+class HeadToHead:
+    """
+    Head-to-head record between two specific teams.
+    home_team and away_team here refer to the UPCOMING match, not H2H venues.
+    """
+    home_team: str
+    away_team: str
+    matches_played: int
+    home_wins: int          # times home_team won in H2H
+    draws: int
+    away_wins: int          # times away_team won in H2H
+    avg_goals_total: float  # average total goals in H2H matches
+    home_avg_scored: float  # avg goals scored by home_team in H2H
+    away_avg_scored: float  # avg goals scored by away_team in H2H
+
+    @property
+    def home_win_rate(self) -> float:
+        """Home team H2H win rate (0.0–1.0)."""
+        return round(self.home_wins / max(self.matches_played, 1), 3)
+
+    @property
+    def away_win_rate(self) -> float:
+        """Away team H2H win rate (0.0–1.0)."""
+        return round(self.away_wins / max(self.matches_played, 1), 3)
+
+    @property
+    def draw_rate(self) -> float:
+        return round(self.draws / max(self.matches_played, 1), 3)
+
+    @property
+    def is_high_scoring(self) -> bool:
+        """True if H2H fixtures tend to go over 2.5 goals."""
+        return self.avg_goals_total > 2.5
+
+    @property
+    def home_dominance(self) -> float:
+        """
+        How much the home team dominates this H2H fixture.
+        Positive = home team tends to win, negative = away team tends to win.
+        Range roughly -1.0 to +1.0.
+        """
+        return round(self.home_win_rate - self.away_win_rate, 3)
+
+
 @dataclass
 class ModelOutput:
     """Raw output from the prediction model — no presentation concerns."""
@@ -127,8 +214,11 @@ class ModelOutput:
     away_strength: float
     goal_distribution: Dict[str, float]   # keys: "exactly_0", "exactly_1", …
     value_bet: Optional[ValueBet] = None
-    home_form: Optional[TeamForm] = None  # last FORM_WINDOW games for home team
-    away_form: Optional[TeamForm] = None  # last FORM_WINDOW games for away team
+    home_form: Optional[TeamForm] = None       # last FORM_WINDOW games for home team
+    away_form: Optional[TeamForm] = None       # last FORM_WINDOW games for away team
+    home_split: Optional[HomeAwaySplit] = None # home team's home-venue record
+    away_split: Optional[HomeAwaySplit] = None # away team's away-venue record
+    h2h: Optional[HeadToHead] = None           # head-to-head history
 
     # ── Derived properties ────────────────────────────────────────────────────
 
@@ -190,7 +280,6 @@ class SummaryStats:
 class ConsoleRenderer:
     """Renders predictions to stdout using colorama for cross-platform colour."""
 
-    # Map result letter → colour
     _RESULT_COLOURS = {
         "W": Fore.GREEN,
         "D": Fore.YELLOW,
@@ -217,64 +306,44 @@ class ConsoleRenderer:
         print("=" * 80)
         self._render_summary(SummaryStats.from_predictions(predictions))
 
-    # ── Private helpers ───────────────────────────────────────────────────────
-
     def _render_match(self, pred: ModelOutput) -> None:
-        conf_color = (
-            Fore.GREEN if pred.confidence is ConfidenceLevel.HIGH else Fore.YELLOW
-        )
+        print(f"\n{pred.home_team} vs {pred.away_team}")
+        print(f"  League: {pred.league}  |  Date: {pred.date}")
+        print(f"  Predicted goals: {pred.predicted_goals:.1f}")
+        print(f"  Over 2.5: {pred.over_prob:.0%}  |  Under 2.5: {pred.under_prob:.0%}")
+        print(f"  Confidence: {pred.confidence.value.upper()}")
 
-        print(f"\n{Style.BRIGHT}{pred.home_team} vs {pred.away_team}{Style.RESET_ALL}")
-        print("─" * 60)
-        print(f"  League: {pred.league:<20} Date: {pred.date}")
-        print(f"  {conf_color}Confidence: {pred.confidence.value.upper()}{Style.RESET_ALL}")
-        print(
-            f"\n  {Fore.BLUE}Predicted Total Goals: "
-            f"{pred.predicted_goals:.2f}{Style.RESET_ALL}"
-        )
-        print(
-            f"  Expected Score: "
-            f"{pred.expected_home_goals:.1f} – {pred.expected_away_goals:.1f}"
-        )
-        print(f"\n  Over {GOAL_THRESHOLD} Probability:  {pred.over_prob:.1%}")
-        print(f"  Under {GOAL_THRESHOLD} Probability: {pred.under_prob:.1%}")
+        if pred.home_form:
+            print(f"  {pred.home_team} form: {pred.home_form.form_string} "
+                  f"(momentum {pred.home_form.momentum:.0%})")
+        if pred.away_form:
+            print(f"  {pred.away_team} form: {pred.away_form.form_string} "
+                  f"(momentum {pred.away_form.momentum:.0%})")
 
-        # ── Form section ──────────────────────────────────────────────────
-        if pred.home_form or pred.away_form:
-            print(f"\n  Last {FORM_WINDOW} Games Form:")
-            if pred.home_form:
-                self._render_form(pred.home_form)
-            if pred.away_form:
-                self._render_form(pred.away_form)
+        if pred.home_split:
+            print(f"  {pred.home_team} at home: "
+                  f"{pred.home_split.avg_scored:.2f} scored / "
+                  f"{pred.home_split.avg_conceded:.2f} conceded per game")
+        if pred.away_split:
+            print(f"  {pred.away_team} away: "
+                  f"{pred.away_split.avg_scored:.2f} scored / "
+                  f"{pred.away_split.avg_conceded:.2f} conceded per game")
 
-        print("\n  Goal Distribution:")
-        self._render_distribution(pred.goal_distribution_items)
+        if pred.h2h and pred.h2h.matches_played > 0:
+            print(f"  H2H ({pred.h2h.matches_played} games): "
+                  f"{pred.h2h.home_team} wins {pred.h2h.home_win_rate:.0%} | "
+                  f"draws {pred.h2h.draw_rate:.0%} | "
+                  f"avg {pred.h2h.avg_goals_total:.1f} goals")
 
         if pred.value_bet:
-            edge = pred.value_bet.edge
-            color = Fore.GREEN if edge > 0.10 else Fore.YELLOW
-            print(
-                f"\n  {color}💰 VALUE BET: {pred.value_bet.recommendation}"
-                f"{Style.RESET_ALL}"
-            )
-            print(
-                f"     Edge: {edge:.1%} | Kelly Stake: {pred.value_bet.kelly_stake:.1f}%"
-            )
+            print(f"  VALUE BET: {pred.value_bet.recommendation} "
+                  f"(edge {pred.value_bet.edge:.0%}, "
+                  f"Kelly {pred.value_bet.kelly_stake:.1f}%)")
 
-    def _render_form(self, form: TeamForm) -> None:
-        """Print a coloured W/D/L row for a team."""
-        coloured = " ".join(
-            f"{self._RESULT_COLOURS.get(r, '')}{r}{Style.RESET_ALL}"
-            for r in form.results
-        )
-        print(
-            f"    {form.team_name:<25} {coloured}"
-            f"  ({form.points}pts  "
-            f"GF:{form.avg_scored:.1f}  GA:{form.avg_conceded:.1f}  "
-            f"Momentum:{form.momentum:.0%})"
-        )
+        self._render_distribution(pred.goal_distribution_items)
 
     def _render_distribution(self, items: List[Tuple[int, float]]) -> None:
+        print("  Goal distribution:")
         for goal_count, prob in items:
             bar = "█" * int(prob * CONSOLE_BAR_WIDTH)
             print(f"    {goal_count} goals: {bar:<{CONSOLE_BAR_WIDTH}} {prob:.1%}")
@@ -292,10 +361,7 @@ class ConsoleRenderer:
 
 
 class HtmlRenderer:
-    """
-    Renders predictions to a self-contained HTML file using Jinja2.
-    All user-facing strings are auto-escaped by the template engine.
-    """
+    """Renders predictions to a self-contained HTML file using Jinja2."""
 
     def __init__(self, template_dir: Path = TEMPLATE_DIR) -> None:
         self._env = Environment(
@@ -365,8 +431,6 @@ class DataExporter:
             logger.error("Failed to write JSON: %s", exc)
             raise
 
-    # ── Private helpers ───────────────────────────────────────────────────────
-
     def _flatten(self, pred: ModelOutput) -> Dict:
         row: Dict = {
             "match_id":             pred.match_id,
@@ -383,10 +447,9 @@ class DataExporter:
             "home_strength":        pred.home_strength,
             "away_strength":        pred.away_strength,
         }
-        # Form columns
         if pred.home_form:
-            row["home_form"]      = pred.home_form.form_string
-            row["home_momentum"]  = pred.home_form.momentum
+            row["home_form"]          = pred.home_form.form_string
+            row["home_momentum"]      = pred.home_form.momentum
             row["home_avg_scored"]    = pred.home_form.avg_scored
             row["home_avg_conceded"]  = pred.home_form.avg_conceded
         else:
@@ -394,13 +457,35 @@ class DataExporter:
             row["home_avg_scored"] = row["home_avg_conceded"] = None
 
         if pred.away_form:
-            row["away_form"]      = pred.away_form.form_string
-            row["away_momentum"]  = pred.away_form.momentum
+            row["away_form"]          = pred.away_form.form_string
+            row["away_momentum"]      = pred.away_form.momentum
             row["away_avg_scored"]    = pred.away_form.avg_scored
             row["away_avg_conceded"]  = pred.away_form.avg_conceded
         else:
             row["away_form"] = row["away_momentum"] = ""
             row["away_avg_scored"] = row["away_avg_conceded"] = None
+
+        if pred.home_split:
+            row["home_venue_scored"]   = pred.home_split.avg_scored
+            row["home_venue_conceded"] = pred.home_split.avg_conceded
+        else:
+            row["home_venue_scored"] = row["home_venue_conceded"] = None
+
+        if pred.away_split:
+            row["away_venue_scored"]   = pred.away_split.avg_scored
+            row["away_venue_conceded"] = pred.away_split.avg_conceded
+        else:
+            row["away_venue_scored"] = row["away_venue_conceded"] = None
+
+        if pred.h2h:
+            row["h2h_played"]    = pred.h2h.matches_played
+            row["h2h_home_wins"] = pred.h2h.home_wins
+            row["h2h_draws"]     = pred.h2h.draws
+            row["h2h_away_wins"] = pred.h2h.away_wins
+            row["h2h_avg_goals"] = pred.h2h.avg_goals_total
+        else:
+            row["h2h_played"] = row["h2h_home_wins"] = row["h2h_draws"] = None
+            row["h2h_away_wins"] = row["h2h_avg_goals"] = None
 
         if pred.value_bet:
             row["value_recommendation"] = pred.value_bet.recommendation
@@ -417,36 +502,74 @@ class DataExporter:
             if f is None:
                 return None
             return {
-                "team_name":     f.team_name,
-                "results":       f.results,
-                "goals_scored":  f.goals_scored,
+                "team_name":      f.team_name,
+                "results":        f.results,
+                "goals_scored":   f.goals_scored,
                 "goals_conceded": f.goals_conceded,
-                "form_string":   f.form_string,
-                "form_rating":   f.form_rating,
-                "momentum":      f.momentum,
-                "avg_scored":    f.avg_scored,
-                "avg_conceded":  f.avg_conceded,
-                "points":        f.points,
+                "form_string":    f.form_string,
+                "form_rating":    f.form_rating,
+                "momentum":       f.momentum,
+                "avg_scored":     f.avg_scored,
+                "avg_conceded":   f.avg_conceded,
+                "points":         f.points,
+            }
+
+        def _split_to_dict(s: Optional[HomeAwaySplit]) -> Optional[Dict]:
+            if s is None:
+                return None
+            return {
+                "team_name":    s.team_name,
+                "venue":        s.venue,
+                "played":       s.played,
+                "wins":         s.wins,
+                "draws":        s.draws,
+                "losses":       s.losses,
+                "goals_for":    s.goals_for,
+                "goals_against":s.goals_against,
+                "avg_scored":   s.avg_scored,
+                "avg_conceded": s.avg_conceded,
+            }
+
+        def _h2h_to_dict(h: Optional[HeadToHead]) -> Optional[Dict]:
+            if h is None:
+                return None
+            return {
+                "home_team":       h.home_team,
+                "away_team":       h.away_team,
+                "matches_played":  h.matches_played,
+                "home_wins":       h.home_wins,
+                "draws":           h.draws,
+                "away_wins":       h.away_wins,
+                "avg_goals_total": h.avg_goals_total,
+                "home_avg_scored": h.home_avg_scored,
+                "away_avg_scored": h.away_avg_scored,
+                "home_win_rate":   h.home_win_rate,
+                "away_win_rate":   h.away_win_rate,
+                "home_dominance":  h.home_dominance,
+                "is_high_scoring": h.is_high_scoring,
             }
 
         return {
-            "match_id":          pred.match_id,
-            "date":              pred.date,
-            "league":            pred.league,
-            "home_team":         pred.home_team,
-            "away_team":         pred.away_team,
+            "match_id":            pred.match_id,
+            "date":                pred.date,
+            "league":              pred.league,
+            "home_team":           pred.home_team,
+            "away_team":           pred.away_team,
             "expected_home_goals": pred.expected_home_goals,
             "expected_away_goals": pred.expected_away_goals,
-            "predicted_goals":   pred.predicted_goals,
-            "over_prob":         pred.over_prob,
-            "under_prob":        pred.under_prob,
-            "confidence":        pred.confidence.value,
-            "home_strength":     pred.home_strength,
-            "away_strength":     pred.away_strength,
-            "goal_distribution": pred.goal_distribution,
-            "home_form":         _form_to_dict(pred.home_form),
-            "away_form":         _form_to_dict(pred.away_form),
-            "value_bet":         asdict(pred.value_bet) if pred.value_bet else None,
+            "predicted_goals":     pred.predicted_goals,
+            "over_prob":           pred.over_prob,
+            "under_prob":          pred.under_prob,
+            "confidence":          pred.confidence.value,
+            "home_strength":       pred.home_strength,
+            "away_strength":       pred.away_strength,
+            "goal_distribution":   pred.goal_distribution,
+            "home_form":           _form_to_dict(pred.home_form),
+            "away_form":           _form_to_dict(pred.away_form),
+            "home_split":          _split_to_dict(pred.home_split),
+            "away_split":          _split_to_dict(pred.away_split),
+            "h2h":                 _h2h_to_dict(pred.h2h),
+            "value_bet":           asdict(pred.value_bet) if pred.value_bet else None,
         }
 
 
