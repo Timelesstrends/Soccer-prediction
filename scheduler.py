@@ -27,6 +27,7 @@ from client_odds_api import OddsAPIClient
 from client_training_data import StatsBombClient, UnderstatClient
 from config import FOOTBALL_DATA, SCHEDULER, SchedulerConfig
 from prediction_dashboard import ModelOutput, PredictionDashboard
+from results_tracker import ResultsTracker
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,9 @@ class PredictionScheduler:
             task=self._task_fetch_training_data,
         )
 
+        # Results fetch — nightly at 02:00 UTC (after most matches finish)
+        self._schedule_daily(2, 0, self._task_fetch_results)
+
     def _task_fetch_fixtures(self) -> None:
         """Fetch fresh fixtures and rebuild predictions."""
         logger.info("[Scheduler] Fetching fixtures.")
@@ -191,6 +195,19 @@ class PredictionScheduler:
             logger.error("[Scheduler] Training data fetch failed: %s", exc)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _task_fetch_results(self) -> None:
+        """Fetch finished results and reconcile against logged predictions."""
+        logger.info("[Scheduler] Fetching results.")
+        try:
+            tracker = ResultsTracker(self._fixtures_client)
+            summary = tracker.run()
+            logger.info(
+                "[Scheduler] Results: %d resolved, %d skipped / %d checked",
+                summary["resolved"], summary["skipped"], summary["checked"],
+            )
+        except Exception as exc:
+            logger.error("[Scheduler] Results fetch failed: %s", exc)
 
     def _fetch_fixtures(self) -> List[ModelOutput]:
         """Pull fixtures from all configured leagues."""

@@ -30,6 +30,8 @@ from typing import Callable, Dict, List, Optional
 from flask import Flask, jsonify, render_template_string, request, Response
 
 from prediction_dashboard import ModelOutput, PredictionDashboard, TeamForm, ValueBet, SummaryStats
+import database as db
+from results_tracker import ResultsTracker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -97,6 +99,13 @@ def create_app() -> Flask:
     Live data loading is triggered by the LIVE_MODE env variable.
     """
     app = Flask(__name__)
+
+    # Initialise SQLite database (creates file + tables on first run)
+    try:
+        db.init_db()
+    except Exception as _db_exc:
+        logger.warning("DB init failed: %s", _db_exc)
+
     # Force ASCII-safe JSON and HTML encoding so special characters
     # in team names (accents etc.) never cause UnicodeEncodeError
     app.config["JSON_AS_ASCII"] = True
@@ -241,6 +250,40 @@ def _register_routes(app: Flask) -> None:
             count = len(_predictions)
         return jsonify({"status": "ok", "predictions_loaded": count})
 
+    @app.route("/api/performance")
+    @requires_auth
+    def api_performance() -> Response:
+        """Return model accuracy and P&L stats from the database."""
+        try:
+            perf    = db.get_performance()
+            summary = db.get_db_summary()
+            return jsonify({"status": "ok", "performance": perf, "db": summary})
+        except Exception as exc:
+            return jsonify({"status": "error", "message": str(exc)}), 500
+
+    @app.route("/api/results/recent")
+    @requires_auth
+    def api_results_recent() -> Response:
+        """Return the last 100 resolved predictions for the history browser."""
+        try:
+            results = db.get_recent_results(limit=100)
+            return jsonify({"status": "ok", "count": len(results), "results": results})
+        except Exception as exc:
+            return jsonify({"status": "error", "message": str(exc)}), 500
+
+    @app.route("/api/results/refresh")
+    @requires_auth
+    def api_results_refresh() -> Response:
+        """Manually trigger a results fetch (useful for testing)."""
+        from client_football_data import FootballDataClient
+        from results_tracker import ResultsTracker
+        try:
+            tracker = ResultsTracker(FootballDataClient())
+            summary = tracker.run()
+            return jsonify({"status": "ok", **summary})
+        except Exception as exc:
+            return jsonify({"status": "error", "message": str(exc)}), 500
+
     @app.route("/favicon.ico")
     def favicon() -> Response:
         return Response(status=204)
@@ -344,6 +387,12 @@ def _start_live_mode(app: Flask) -> None:
         update_predictions(all_predictions)
         logger.info("Phase 1 complete: %d matches visible in browser", len(all_predictions))
 
+        # Log Phase 1 predictions to DB (idempotent — skips existing match_ids)
+        try:
+            db.log_predictions_bulk(all_predictions)
+        except Exception as exc:
+            logger.warning("DB log failed (Phase 1): %s", exc)
+
         # ── Phase 2: full model per league (form + H2H) ───────────────────
         logger.info("Phase 2: fetching form + H2H (runs in background)...")
         phase2_all: List[ModelOutput] = []
@@ -368,6 +417,13 @@ def _start_live_mode(app: Flask) -> None:
                     pass
 
                 update_predictions(merged)
+
+                # Log the fully-blended Phase 2 predictions (updates existing rows)
+                try:
+                    db.log_predictions_bulk(league_preds)
+                except Exception as exc:
+                    logger.warning("DB log failed (Phase 2 %s): %s", league_code, exc)
+
             except Exception as exc:
                 logger.warning("  Phase 2 failed for %s — %s", league_code, exc)
 
