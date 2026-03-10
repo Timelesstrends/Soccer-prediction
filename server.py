@@ -253,12 +253,17 @@ def _register_routes(app: Flask) -> None:
 
 def _start_live_mode(app: Flask) -> None:
     """
-    Fetch live data in two phases so the dashboard shows data quickly:
+    Fetch live data in two phases so the dashboard shows data quickly.
 
-    Phase 1 (fast): fixtures + standings + odds  →  browser shows matches
-    Phase 2 (slow): form for each team           →  browser updates with W/D/L
+    Phase 1 (fast, ~30s per league):
+        Fixtures + standings (total/home/away) + odds.
+        Uses season strength + venue splits only — no form API calls.
+        Browser shows real xG values immediately.
 
-    This prevents a single slow API call from blocking the whole startup.
+    Phase 2 (slow, ~6s per team):
+        Adds weighted form + H2H for each match via build_model_outputs().
+        Replaces Phase 1 predictions with fully-blended model outputs
+        progressively after each league completes.
     """
     from client_football_data import FootballDataClient
     from client_odds_api import OddsAPIClient
@@ -271,86 +276,102 @@ def _start_live_mode(app: Flask) -> None:
         football_client = FootballDataClient()
         odds_client     = OddsAPIClient()
 
-        # ── Phase 1: fixtures only (no form) ──────────────────────────────
-        logger.info("Phase 1: fetching fixtures...")
+        # ── Phase 1: strength + venue splits only (no form API calls) ─────
+        logger.info("Phase 1: fetching fixtures and standings...")
         all_predictions: List[ModelOutput] = []
 
         for league_code in FOOTBALL_DATA.league_codes:
             try:
-                # Fetch fixtures WITHOUT form (skip get_team_form)
                 matches   = football_client.get_matches(league_code)
                 standings = football_client.get_standings(league_code)
-                strength_map = football_client._build_strength_map(standings)
+
+                # standings is now {total, home, away} — use all three
+                strength_map = football_client._build_strength_map(standings["total"])
+                home_map     = football_client._build_venue_split_map(standings["home"], "home")
+                away_map     = football_client._build_venue_split_map(standings["away"], "away")
 
                 for match in matches:
                     try:
                         home_name = match["homeTeam"]["name"]
                         away_name = match["awayTeam"]["name"]
+
+                        # Season strength signal
                         hs = strength_map.get(home_name, 1.0)
                         as_ = strength_map.get(away_name, 1.0)
-                        xg_home = round(hs * 1.35, 2)
-                        xg_away = round(as_ * 1.10, 2)
-                        from prediction_dashboard import ModelOutput
+                        xg_season_home = hs * 1.35
+                        xg_season_away = as_ * 1.10
+
+                        # Venue split signal
+                        home_split = home_map.get(home_name)
+                        away_split = away_map.get(away_name)
+                        xg_venue_home = home_split.xg_estimate if home_split else xg_season_home
+                        xg_venue_away = away_split.xg_estimate if away_split else xg_season_away
+
+                        # Blend: 70% season, 30% venue (no form yet)
+                        xg_home = round(xg_season_home * 0.70 + xg_venue_home * 0.30, 2)
+                        xg_away = round(xg_season_away * 0.70 + xg_venue_away * 0.30, 2)
+                        xg_home = max(xg_home, 0.3)
+                        xg_away = max(xg_away, 0.3)
+
                         pred = ModelOutput(
-                            match_id=str(match["id"]),
-                            date=match["utcDate"][:10],
-                            league=match["competition"]["name"],
-                            home_team=home_name,
-                            away_team=away_name,
-                            expected_home_goals=xg_home,
-                            expected_away_goals=xg_away,
-                            home_strength=hs,
-                            away_strength=as_,
-                            goal_distribution=football_client._poisson_distribution(xg_home + xg_away),
+                            match_id            = str(match["id"]),
+                            date                = match["utcDate"][:10],
+                            league              = match["competition"]["name"],
+                            home_team           = home_name,
+                            away_team           = away_name,
+                            expected_home_goals = xg_home,
+                            expected_away_goals = xg_away,
+                            home_strength       = hs,
+                            away_strength       = as_,
+                            goal_distribution   = football_client._poisson_distribution(xg_home + xg_away),
+                            home_split          = home_split,
+                            away_split          = away_split,
                         )
                         all_predictions.append(pred)
                     except (KeyError, TypeError):
                         continue
 
-                logger.info("  %s: %d fixtures", league_code, len(matches))
+                logger.info("  Phase 1 %s: %d fixtures", league_code, len(matches))
             except Exception as exc:
-                logger.warning("  %s skipped — %s", league_code, exc)
+                logger.warning("  Phase 1 %s skipped — %s", league_code, exc)
 
-        # Attach odds and push to browser immediately
+        # Attach odds before pushing to browser
         try:
             all_predictions = odds_client.attach_value_bets(all_predictions)
         except Exception as exc:
-            logger.warning("Odds skipped — %s", exc)
+            logger.warning("Odds skipped in Phase 1 — %s", exc)
 
         update_predictions(all_predictions)
         logger.info("Phase 1 complete: %d matches visible in browser", len(all_predictions))
 
-        # ── Phase 2: fetch form for each team in background ───────────────
-        logger.info("Phase 2: fetching team form (slow - runs in background)...")
-        updated = 0
-        for pred in all_predictions:
-            try:
-                home_id = None
-                away_id = None
-                # Get team IDs from the API cache if possible
-                matches_cache = football_client.get_matches(pred.league[:2] if False else "PL")
-            except Exception:
-                pass
+        # ── Phase 2: full model per league (form + H2H) ───────────────────
+        logger.info("Phase 2: fetching form + H2H (runs in background)...")
+        phase2_all: List[ModelOutput] = []
 
-        # Better approach: re-run build_model_outputs which fetches form
-        # but now fixtures are cached so only form calls are slow
-        phase2_predictions: List[ModelOutput] = []
         for league_code in FOOTBALL_DATA.league_codes:
             try:
-                preds = football_client.build_model_outputs(league_code)
-                phase2_predictions.extend(preds)
-                logger.info("  Form done for %s", league_code)
-                # Update browser progressively after each league
-                merged = _merge_form(all_predictions, phase2_predictions)
+                # build_model_outputs fetches form + H2H using all 4 signals
+                league_preds = football_client.build_model_outputs(league_code)
+                phase2_all.extend(league_preds)
+                logger.info("  Phase 2 done for %s (%d matches)", league_code, len(league_preds))
+
+                # Replace predictions for completed leagues immediately
+                # Keep Phase 1 predictions for leagues not yet processed
+                phase2_ids  = {p.match_id for p in phase2_all}
+                merged      = phase2_all + [
+                    p for p in all_predictions if p.match_id not in phase2_ids
+                ]
+
                 try:
                     merged = odds_client.attach_value_bets(merged)
                 except Exception:
                     pass
+
                 update_predictions(merged)
             except Exception as exc:
-                logger.warning("  Form fetch failed for %s — %s", league_code, exc)
+                logger.warning("  Phase 2 failed for %s — %s", league_code, exc)
 
-        logger.info("Phase 2 complete: form loaded for all teams")
+        logger.info("Phase 2 complete: full model active for all leagues")
 
         # ── Start scheduler ───────────────────────────────────────────────
         scheduler = PredictionScheduler(dashboard, output_dir="predictions")
@@ -368,17 +389,8 @@ def _start_live_mode(app: Flask) -> None:
     thread.start()
 
 
-def _merge_form(
-    base: List[ModelOutput], with_form: List[ModelOutput]
-) -> List[ModelOutput]:
-    """Copy home_form/away_form from with_form into base predictions by match_id."""
-    form_map = {p.match_id: p for p in with_form}
-    for pred in base:
-        fp = form_map.get(pred.match_id)
-        if fp:
-            pred.home_form = fp.home_form
-            pred.away_form = fp.away_form
-    return base
+# _merge_form removed — Phase 2 now fully replaces Phase 1 predictions
+# rather than patching them, so this helper is no longer needed.
 
 
 # ── Serialisation helper ──────────────────────────────────────────────────────
