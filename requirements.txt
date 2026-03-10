@@ -1,0 +1,14 @@
+# ── Web server ────────────────────────────────────────────────────────────────
+flask==3.1.2
+gunicorn==21.2.0
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+pandas==3.0.1
+numpy==2.4.2
+
+# ── Templating & display ──────────────────────────────────────────────────────
+jinja2==3.1.6
+colorama==0.4.6
+
+# ── Standard library (no install needed) ──────────────────────────────────────
+# urllib, sched, threading, json, csv, logging, pathlib, dataclasses, enum
