@@ -34,6 +34,16 @@ from prediction_dashboard import (
     HeadToHead, HomeAwaySplit, MatchResult, ModelOutput, TeamForm,
 )
 
+# ── Fitted model coefficients (loaded once, refreshed nightly) ───────────────
+# If model_trainer has produced fitted coefficients they are used in place of
+# the hand-tuned strength-ratio approach. Falls back silently if unavailable.
+def _load_fitted_coefficients() -> Optional[Dict[str, Any]]:
+    try:
+        from model_trainer import load as _trainer_load
+        return _trainer_load()
+    except Exception:
+        return None
+
 # ── Rate limiting ──────────────────────────────────────────────────────────────
 # Free tier: 10 requests/minute → 6 seconds minimum between calls
 _RATE_LIMIT_DELAY: float = 6.5
@@ -391,10 +401,35 @@ class FootballDataClient:
         match_id   = match["id"]
 
         # ── Signal 1: season strength ─────────────────────────────────────
-        home_strength = strength_map.get(home_name, 1.0)
-        away_strength = strength_map.get(away_name, 1.0)
-        xg_season_home = home_strength * 1.35   # home advantage multiplier
-        xg_season_away = away_strength * 1.10   # slight penalty playing away
+        # If fitted Dixon-Coles coefficients exist, use attack/defence ratings
+        # derived from MLE. Otherwise fall back to the hand-tuned strength ratio.
+        _fitted = _load_fitted_coefficients()
+        if _fitted and "teams" in _fitted:
+            _teams     = _fitted["teams"]
+            _home_adv  = _fitted.get("home_advantage", 1.2)
+            _home_coef = _teams.get(home_name, {})
+            _away_coef = _teams.get(away_name, {})
+            # λ = attack_home * defence_away * home_advantage
+            home_strength = _home_coef.get("attack", 1.0)
+            away_strength = _away_coef.get("attack", 1.0)
+            xg_season_home = (
+                _home_coef.get("attack",  1.0) *
+                _away_coef.get("defence", 1.0) *
+                _home_adv
+            )
+            xg_season_away = (
+                _away_coef.get("attack",  1.0) *
+                _home_coef.get("defence", 1.0)
+            )
+            logger.debug(
+                "Using fitted coefficients for %s vs %s (home_adv=%.3f)",
+                home_name, away_name, _home_adv,
+            )
+        else:
+            home_strength  = strength_map.get(home_name, 1.0)
+            away_strength  = strength_map.get(away_name, 1.0)
+            xg_season_home = home_strength * 1.35   # home advantage multiplier
+            xg_season_away = away_strength * 1.10   # slight penalty playing away
 
         # ── Signal 2: weighted recent form ───────────────────────────────
         try:

@@ -135,6 +135,9 @@ class PredictionScheduler:
         # Results fetch — nightly at 02:00 UTC (after most matches finish)
         self._schedule_daily(2, 0, self._task_fetch_results)
 
+        # Model training — nightly at 02:30 UTC (after results are in)
+        self._schedule_daily(2, 30, self._task_train_model)
+
     def _task_fetch_fixtures(self) -> None:
         """Fetch fresh fixtures and rebuild predictions."""
         logger.info("[Scheduler] Fetching fixtures.")
@@ -208,6 +211,34 @@ class PredictionScheduler:
             )
         except Exception as exc:
             logger.error("[Scheduler] Results fetch failed: %s", exc)
+
+    def _task_train_model(self) -> None:
+        """
+        Fit Dixon-Coles attack/defence coefficients from resolved match history.
+        Runs at 02:30 UTC — 30 minutes after the results fetch, giving the DB
+        time to populate before training starts.
+        Silently skips if fewer than MIN_MATCHES resolved matches exist.
+        """
+        logger.info("[Scheduler] Running nightly model training.")
+        try:
+            from model_trainer import train, MIN_MATCHES
+            result = train()
+            if result.get("fitted"):
+                logger.info(
+                    "[Scheduler] Model trained on %d matches — "
+                    "home_advantage=%.3f, rho=%.4f, %d teams",
+                    result["trained_on"],
+                    result["home_advantage"],
+                    result["rho"],
+                    len(result.get("teams", {})),
+                )
+            else:
+                logger.info(
+                    "[Scheduler] Model training skipped — %d/%d matches available.",
+                    result.get("trained_on", 0), MIN_MATCHES,
+                )
+        except Exception as exc:
+            logger.error("[Scheduler] Model training failed: %s", exc)
 
     def _fetch_fixtures(self) -> List[ModelOutput]:
         """Pull fixtures from all configured leagues."""

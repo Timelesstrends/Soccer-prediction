@@ -448,6 +448,38 @@ def get_recent_results(limit: int = 100, path: Path = DB_PATH) -> List[Dict]:
     return [dict(r) for r in rows]
 
 
+def get_training_rows(path: Path = DB_PATH) -> List[Dict]:
+    """
+    Return all resolved matches as training data for the Dixon-Coles fitter.
+
+    Each row contains the inputs the model had at prediction time plus the
+    actual scoreline — exactly what MLE needs.
+    """
+    sql = """
+        SELECT
+            p.home_team,
+            p.away_team,
+            p.league,
+            p.match_date,
+            p.home_strength,
+            p.away_strength,
+            p.home_momentum,
+            p.away_momentum,
+            p.h2h_avg_goals,
+            p.home_venue_scored,
+            p.away_venue_scored,
+            r.home_goals,
+            r.away_goals,
+            r.total_goals
+        FROM   predictions p
+        JOIN   results r ON p.match_id = r.match_id
+        ORDER  BY p.match_date ASC
+    """
+    with _connect(path) as conn:
+        rows = conn.execute(sql).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_db_summary(path: Path = DB_PATH) -> Dict[str, int]:
     """Row counts for each table — used by the health endpoint."""
     with _connect(path) as conn:
