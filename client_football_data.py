@@ -519,6 +519,26 @@ class FootballDataClient:
             match_result        = match_result,
         )
 
+    def _build_strength_map(self, standings_table: List[Dict]) -> Dict[str, float]:
+        """
+        Derive a strength rating (0.5–2.0) for each team from their
+        season goals-for / goals-against ratio.
+        """
+        strength_map: Dict[str, float] = {}
+        for row in standings_table:
+            try:
+                team_name     = row["team"]["name"]
+                goals_for     = row.get("goalsFor",     1) or 1
+                goals_against = row.get("goalsAgainst", 1) or 1
+                played        = row.get("playedGames",  1) or 1
+                avg_for     = goals_for     / played
+                avg_against = goals_against / played
+                ratio = avg_for / max(avg_against, 0.5)
+                strength_map[team_name] = round(min(max(ratio, 0.5), 2.0), 3)
+            except (KeyError, TypeError, ZeroDivisionError):
+                continue
+        return strength_map
+
     def _build_position_map(self, standings_table: List[Dict]) -> Dict[str, int]:
         """
         Build a {team_name: position} map from the total standings table.
