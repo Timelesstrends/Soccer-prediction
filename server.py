@@ -29,7 +29,7 @@ from typing import Callable, Dict, List, Optional
 
 from flask import Flask, jsonify, render_template_string, request, Response
 
-from prediction_dashboard import ModelOutput, PredictionDashboard, TeamForm, ValueBet, SummaryStats
+from prediction_dashboard import ModelOutput, MatchResult, PredictionDashboard, TeamForm, ValueBet, SummaryStats
 import database as db
 from results_tracker import ResultsTracker
 
@@ -513,6 +513,17 @@ def _serialise_prediction(pred: ModelOutput) -> dict:
         "home_split":              _serialise_split(pred.home_split),
         "away_split":              _serialise_split(pred.away_split),
         "h2h":                     _serialise_h2h(pred.h2h),
+        "match_result": {
+            "home_prob":         pred.match_result.home_prob,
+            "draw_prob":         pred.match_result.draw_prob,
+            "away_prob":         pred.match_result.away_prob,
+            "outcome":           pred.match_result.outcome,
+            "outcome_confidence": pred.match_result.outcome_confidence,
+            "most_likely_score": list(pred.match_result.most_likely_score),
+            "most_likely_prob":  pred.match_result.most_likely_prob,
+            "home_position":     pred.match_result.home_position,
+            "away_position":     pred.match_result.away_position,
+        } if pred.match_result else None,
         "value_bet": {
             "recommendation": pred.value_bet.recommendation,
             "edge":           pred.value_bet.edge,
@@ -539,6 +550,11 @@ def _build_mock_predictions() -> List[ModelOutput]:
                 recommendation="Over 2.5 Goals @ 1.85 (Pinnacle)",
                 edge=0.14, kelly_stake=8.5,
             ),
+            match_result=MatchResult(
+                home_prob=0.52, draw_prob=0.24, away_prob=0.24,
+                most_likely_score=(2, 1), most_likely_prob=0.11,
+                home_position=2, away_position=6,
+            ),
             home_form=TeamForm(
                 team_name="Arsenal",
                 results=["W", "W", "D", "W", "W"],
@@ -563,6 +579,11 @@ def _build_mock_predictions() -> List[ModelOutput]:
                 "exactly_6": 0.04,
             },
             value_bet=None,
+            match_result=MatchResult(
+                home_prob=0.38, draw_prob=0.30, away_prob=0.32,
+                most_likely_score=(1, 1), most_likely_prob=0.13,
+                home_position=3, away_position=1,
+            ),
             home_form=TeamForm(
                 team_name="Barcelona",
                 results=["W", "D", "W", "L", "W"],
@@ -590,6 +611,11 @@ def _build_mock_predictions() -> List[ModelOutput]:
                 recommendation="Over 3.5 Goals @ 2.10 (Bet365)",
                 edge=0.08, kelly_stake=4.2,
             ),
+            match_result=MatchResult(
+                home_prob=0.61, draw_prob=0.19, away_prob=0.20,
+                most_likely_score=(3, 2), most_likely_prob=0.09,
+                home_position=1, away_position=4,
+            ),
             home_form=TeamForm(
                 team_name="Bayern Munich",
                 results=["W", "W", "W", "W", "D"],
@@ -614,6 +640,11 @@ def _build_mock_predictions() -> List[ModelOutput]:
                 "exactly_6": 0.05,
             },
             value_bet=None,
+            match_result=MatchResult(
+                home_prob=0.49, draw_prob=0.27, away_prob=0.24,
+                most_likely_score=(1, 0), most_likely_prob=0.12,
+                home_position=2, away_position=5,
+            ),
             home_form=TeamForm(
                 team_name="Inter Milan",
                 results=["W", "D", "W", "W", "D"],
@@ -895,6 +926,27 @@ HTML_TEMPLATE = """
         .h2h-away     { background:var(--red); }
         .h2h-labels   { display:flex; justify-content:space-between; margin-top:.25rem; font-size:.6rem; font-weight:600; }
         .h2h-goals    { font-size:.65rem; color:var(--t3); margin-top:.35rem; }
+
+        /* ── 1X2 result prediction ── */
+        .result-box     { border:1px solid rgba(139,92,246,.25); background:rgba(139,92,246,.05); }
+        .result-bar-wrap { margin:.3rem 0; }
+        .result-bar     { display:flex; height:22px; border-radius:6px; overflow:hidden; gap:2px; }
+        .result-seg     { display:flex; align-items:center; justify-content:center; font-size:.62rem; font-weight:700; color:rgba(255,255,255,.9); transition:width .4s ease; }
+        .result-home    { background:rgba(16,185,129,.55); }
+        .result-draw    { background:rgba(100,116,139,.55); }
+        .result-away    { background:rgba(239,68,68,.55); }
+        .seg-winner     { filter:brightness(1.35); box-shadow:0 0 6px rgba(255,255,255,.15); }
+        .result-footer  { display:flex; justify-content:space-between; align-items:center; margin-top:.35rem; flex-wrap:wrap; gap:.3rem; }
+        .result-outcome { font-size:.72rem; font-weight:700; color:#a78bfa; }
+        .result-score   { font-size:.65rem; color:var(--t3); }
+        .result-score strong { color:var(--t1); }
+        .oc-tag         { font-size:.55rem; font-weight:600; padding:1px 5px; border-radius:4px; margin-left:.4rem; vertical-align:middle; }
+        .oc-high        { background:rgba(16,185,129,.2); color:var(--green); }
+        .oc-medium      { background:rgba(234,179,8,.15); color:#fbbf24; }
+        .oc-low         { background:rgba(100,116,139,.2); color:var(--t3); }
+        .pos-row        { display:flex; align-items:center; justify-content:space-between; margin-top:.4rem; font-size:.63rem; }
+        .pos-badge      { background:rgba(139,92,246,.2); color:#a78bfa; padding:1px 7px; border-radius:4px; font-weight:700; }
+        .pos-label      { color:var(--t3); }
 
         .value-box  { display:flex; align-items:flex-start; gap:.5rem; margin-top:.75rem; padding:.5rem .65rem; background:rgba(16,185,129,.08); border:1px solid rgba(16,185,129,.28); border-radius:8px; }
         .value-icon { font-size:.9rem; flex-shrink:0; margin-top:1px; }
@@ -1249,6 +1301,63 @@ HTML_TEMPLATE = """
                '<div class="dist-lbls">' + lbls + '</div></div>';
     }
 
+    function build1X2(p) {
+        if (!p.match_result) return '';
+        var r       = p.match_result;
+        var hPct    = Math.round((r.home_prob  || 0) * 100);
+        var dPct    = Math.round((r.draw_prob  || 0) * 100);
+        var aPct    = Math.round((r.away_prob  || 0) * 100);
+        var score   = r.most_likely_score ? r.most_likely_score[0] + '-' + r.most_likely_score[1] : '?';
+        var sProb   = Math.round((r.most_likely_prob || 0) * 100);
+        var outcome = r.outcome || '';
+        var oc      = r.outcome_confidence || 'low';
+
+        // Highlight the winning segment
+        var hClass  = (outcome === 'Home Win')  ? ' seg-winner' : '';
+        var dClass  = (outcome === 'Draw')      ? ' seg-winner' : '';
+        var aClass  = (outcome === 'Away Win')  ? ' seg-winner' : '';
+
+        // Table positions
+        var posHtml = '';
+        if (r.home_position || r.away_position) {
+            posHtml = '<div class="pos-row">' +
+                '<span class="pos-badge">#' + (r.home_position || '?') + '</span>' +
+                '<span class="pos-label">League Positions</span>' +
+                '<span class="pos-badge">#' + (r.away_position || '?') + '</span>' +
+            '</div>';
+        }
+
+        return '<div class="form-box result-box">' +
+            '<div class="sec-label">Match Result Prediction ' +
+                '<span class="oc-tag oc-' + oc + '">' + oc + ' confidence</span>' +
+            '</div>' +
+            '<div class="result-bar-wrap">' +
+                '<div class="result-bar">' +
+                    '<div class="result-seg result-home' + hClass + '" style="width:' + hPct + '%">' +
+                        (hPct >= 10 ? hPct + '%' : '') +
+                    '</div>' +
+                    '<div class="result-seg result-draw' + dClass + '" style="width:' + dPct + '%">' +
+                        (dPct >= 10 ? dPct + '%' : '') +
+                    '</div>' +
+                    '<div class="result-seg result-away' + aClass + '" style="width:' + aPct + '%">' +
+                        (aPct >= 10 ? aPct + '%' : '') +
+                    '</div>' +
+                '</div>' +
+                '<div class="h2h-labels">' +
+                    '<span style="color:var(--green)">Home Win</span>' +
+                    '<span style="color:var(--t3)">Draw</span>' +
+                    '<span style="color:var(--red)">Away Win</span>' +
+                '</div>' +
+            '</div>' +
+            '<div class="result-footer">' +
+                '<span class="result-outcome">&#x25B6; ' + esc(outcome) + '</span>' +
+                '<span class="result-score">Most likely score: <strong>' + score +
+                    '</strong> (' + sProb + '%)</span>' +
+            '</div>' +
+            posHtml +
+        '</div>';
+    }
+
     function buildCard(p) {
         var conf    = p.confidence || 'low';
         var home    = esc(cleanName(p.home_team));
@@ -1355,6 +1464,7 @@ HTML_TEMPLATE = """
                     '<div class="pbar-bg"><div class="pbar-fill fill-under" style="width:' +
                     sf((p.under_prob||0)*100,0) + '%"></div></div>' +
                     '<div class="pbar-val">' + sf((p.under_prob||0)*100,0) + '%</div></div>' +
+                build1X2(p) +
                 formHtml +
                 venueHtml +
                 h2hHtml +

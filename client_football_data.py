@@ -31,7 +31,7 @@ from cache import DiskCache
 from config import FOOTBALL_DATA, FootballDataConfig
 from prediction_dashboard import (
     FORM_WINDOW, H2H_WINDOW,
-    HeadToHead, HomeAwaySplit, ModelOutput, TeamForm,
+    HeadToHead, HomeAwaySplit, MatchResult, ModelOutput, TeamForm,
 )
 
 # ── Rate limiting ──────────────────────────────────────────────────────────────
@@ -334,12 +334,13 @@ class FootballDataClient:
         strength_map = self._build_strength_map(standings["total"])
         home_map     = self._build_venue_split_map(standings["home"],  "home")
         away_map     = self._build_venue_split_map(standings["away"],  "away")
+        position_map = self._build_position_map(standings["total"])
 
         outputs: List[ModelOutput] = []
         for match in matches:
             try:
                 outputs.append(
-                    self._match_to_output(match, league_code, strength_map, home_map, away_map)
+                    self._match_to_output(match, league_code, strength_map, home_map, away_map, position_map)
                 )
             except (KeyError, TypeError) as exc:
                 logger.warning(
@@ -357,27 +358,29 @@ class FootballDataClient:
         strength_map: Dict[str, float],
         home_map: Dict[str, HomeAwaySplit],
         away_map: Dict[str, HomeAwaySplit],
+        position_map: Optional[Dict[str, int]] = None,
     ) -> ModelOutput:
         """
-        Map a single match dict to ModelOutput using the 4-signal blend.
+        Map a single match dict to ModelOutput using the 5-signal blend.
 
-        Signal 1 — Season strength (50%)
+        Signal 1 — Season strength (45%)
             Derived from goals-for / goals-against across the full season.
-            Captures overall quality regardless of venue.
 
         Signal 2 — Weighted recent form (20%)
-            Momentum score from last 5 games with exponential recency weighting.
-            A win last week counts ~5x more than a win 5 weeks ago.
+            Exponentially weighted W/D/L across last 5 games.
 
         Signal 3 — Home/away venue split (20%)
-            How many goals the home team scores/concedes at home, and how
-            many the away team scores/concedes away. This captures teams
-            like Atletico Madrid who defend tightly at home but attack away.
+            Venue-specific goals scored/conceded per game.
 
         Signal 4 — Head-to-head history (10%)
-            Average goals scored by each team in their last 10 meetings.
-            Fixtures between specific clubs often have a consistent pattern
-            regardless of current form (e.g. low-scoring derbies).
+            Average goals each team has scored in their last 10 meetings.
+
+        Signal 5 — League table position (5%)
+            Top-half vs bottom-half position bonus/penalty.
+            Rewards teams punching above or below their season average.
+
+        After blending xG, builds a Dixon-Coles goal matrix to derive
+        Home Win / Draw / Away Win probabilities and the most likely scoreline.
         """
         home_team  = match["homeTeam"]
         away_team  = match["awayTeam"]
@@ -439,35 +442,62 @@ class FootballDataClient:
         except Exception as exc:
             logger.warning("H2H failed for %s vs %s: %s", home_name, away_name, exc)
 
-        # ── Blend all 4 signals ───────────────────────────────────────────
+        # ── Signal 5: league table position ──────────────────────────────
+        # Top teams get a small attacking bonus; bottom teams a penalty.
+        # Capped at ±8% so position never overwhelms form or strength.
+        total_teams  = 20
+        pos_map      = position_map or {}
+        home_pos     = pos_map.get(home_name, total_teams // 2)
+        away_pos     = pos_map.get(away_name, total_teams // 2)
+
+        # Position 1 → +0.08 boost, position 20 → -0.08 penalty
+        home_pos_factor = ((total_teams / 2) - home_pos) / (total_teams / 2) * 0.08
+        away_pos_factor = ((total_teams / 2) - away_pos) / (total_teams / 2) * 0.08
+
+        xg_pos_home = xg_season_home * (1 + home_pos_factor)
+        xg_pos_away = xg_season_away * (1 + away_pos_factor)
+
+        # ── Blend all 5 signals (weights sum to 1.0) ──────────────────────
+        W_POS        = 0.05
+        w_season_adj = W_SEASON - W_POS   # 0.45
+
         xg_home = round(
-            xg_season_home * W_SEASON +
-            xg_form_home   * W_FORM   +
-            xg_venue_home  * W_VENUE  +
-            xg_h2h_home    * W_H2H,
+            xg_season_home * w_season_adj +
+            xg_form_home   * W_FORM       +
+            xg_venue_home  * W_VENUE      +
+            xg_h2h_home    * W_H2H        +
+            xg_pos_home    * W_POS,
             2,
         )
         xg_away = round(
-            xg_season_away * W_SEASON +
-            xg_form_away   * W_FORM   +
-            xg_venue_away  * W_VENUE  +
-            xg_h2h_away    * W_H2H,
+            xg_season_away * w_season_adj +
+            xg_form_away   * W_FORM       +
+            xg_venue_away  * W_VENUE      +
+            xg_h2h_away    * W_H2H        +
+            xg_pos_away    * W_POS,
             2,
         )
 
-        # Sanity floor — never predict less than 0.3 goals per team
+        # Floor: never predict less than 0.3 goals per team
         xg_home = max(xg_home, 0.3)
         xg_away = max(xg_away, 0.3)
 
+        # ── Dixon-Coles 1X2 probabilities ─────────────────────────────────
+        match_result = self._compute_match_result(
+            xg_home, xg_away,
+            home_position=home_pos,
+            away_position=away_pos,
+        )
+
         logger.debug(
-            "%s vs %s | season(%.2f,%.2f) form(%.2f,%.2f) "
-            "venue(%.2f,%.2f) h2h(%.2f,%.2f) → xG(%.2f,%.2f)",
-            home_name, away_name,
-            xg_season_home, xg_season_away,
-            xg_form_home,   xg_form_away,
-            xg_venue_home,  xg_venue_away,
-            xg_h2h_home,    xg_h2h_away,
-            xg_home,        xg_away,
+            "%s (pos %d) vs %s (pos %d) | xG(%.2f,%.2f) "
+            "1X2(%.0f%%/%.0f%%/%.0f%%) [%s]",
+            home_name, home_pos, away_name, away_pos,
+            xg_home, xg_away,
+            match_result.home_prob * 100,
+            match_result.draw_prob * 100,
+            match_result.away_prob * 100,
+            match_result.outcome,
         )
 
         return ModelOutput(
@@ -486,9 +516,125 @@ class FootballDataClient:
             home_split          = home_split,
             away_split          = away_split,
             h2h                 = h2h,
+            match_result        = match_result,
         )
 
-    def _build_strength_map(self, standings_table: List[Dict]) -> Dict[str, float]:
+    def _build_position_map(self, standings_table: List[Dict]) -> Dict[str, int]:
+        """
+        Build a {team_name: position} map from the total standings table.
+        Position 1 = top of the table.
+        """
+        pos_map: Dict[str, int] = {}
+        for row in standings_table:
+            try:
+                team_name = row["team"]["name"]
+                position  = row.get("position", 0)
+                if position:
+                    pos_map[team_name] = int(position)
+            except (KeyError, TypeError):
+                continue
+        return pos_map
+
+    @staticmethod
+    def _dixon_coles_matrix(
+        xg_home: float,
+        xg_away: float,
+        max_goals: int = 8,
+    ) -> List[List[float]]:
+        """
+        Build the Dixon-Coles joint goal probability matrix.
+
+        P(home=i, away=j) = Poisson(i|xg_home) * Poisson(j|xg_away) * rho(i,j)
+
+        The rho correction adjusts the probability of low-scoring results
+        (0-0, 1-0, 0-1, 1-1) which Poisson slightly misprices.
+
+        Returns a (max_goals+1) x (max_goals+1) matrix where
+        matrix[i][j] = probability of home scoring i, away scoring j.
+        """
+        rho = -0.13   # Dixon-Coles correction parameter (industry standard)
+
+        def poisson_pmf(k: int, lam: float) -> float:
+            return (lam ** k) * math.exp(-lam) / math.factorial(k)
+
+        def dc_correction(i: int, j: int, lam1: float, lam2: float) -> float:
+            if i == 0 and j == 0:
+                return 1 - lam1 * lam2 * rho
+            if i == 1 and j == 0:
+                return 1 + lam2 * rho
+            if i == 0 and j == 1:
+                return 1 + lam1 * rho
+            if i == 1 and j == 1:
+                return 1 - rho
+            return 1.0
+
+        lam_h = max(xg_home, 0.1)
+        lam_a = max(xg_away, 0.1)
+
+        matrix = []
+        for i in range(max_goals + 1):
+            row = []
+            for j in range(max_goals + 1):
+                p = (
+                    poisson_pmf(i, lam_h)
+                    * poisson_pmf(j, lam_a)
+                    * dc_correction(i, j, lam_h, lam_a)
+                )
+                row.append(max(p, 0.0))
+            matrix.append(row)
+        return matrix
+
+    @staticmethod
+    def _compute_match_result(
+        xg_home: float,
+        xg_away: float,
+        home_position: int = 10,
+        away_position: int = 10,
+    ) -> "MatchResult":
+        """
+        Derive 1X2 probabilities and most likely scoreline from the
+        Dixon-Coles goal matrix.
+        """
+        matrix  = FootballDataClient._dixon_coles_matrix(xg_home, xg_away)
+        n       = len(matrix)
+
+        home_prob = 0.0
+        draw_prob = 0.0
+        away_prob = 0.0
+        best_prob = 0.0
+        best_score = (1, 1)
+
+        for i in range(n):
+            for j in range(n):
+                p = matrix[i][j]
+                if i > j:
+                    home_prob += p
+                elif i == j:
+                    draw_prob += p
+                else:
+                    away_prob += p
+                if p > best_prob:
+                    best_prob  = p
+                    best_score = (i, j)
+
+        # Normalise to sum to 1.0 (small floating point drift from rho correction)
+        total = home_prob + draw_prob + away_prob
+        if total > 0:
+            home_prob /= total
+            draw_prob /= total
+            away_prob /= total
+
+        return MatchResult(
+            home_prob          = round(home_prob, 4),
+            draw_prob          = round(draw_prob, 4),
+            away_prob          = round(away_prob, 4),
+            most_likely_score  = best_score,
+            most_likely_prob   = round(best_prob, 4),
+            home_position      = home_position,
+            away_position      = away_position,
+        )
+
+
         """
         Derive a strength rating (0.5–2.0) for each team from their
         season goals-for / goals-against ratio.

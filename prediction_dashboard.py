@@ -48,6 +48,50 @@ class ValueBet:
 
 
 @dataclass(frozen=True)
+class MatchResult:
+    """
+    1X2 match outcome probabilities derived from the Dixon-Coles goal matrix.
+
+    home_prob  — probability home team wins
+    draw_prob  — probability of a draw
+    away_prob  — probability away team wins
+    most_likely_score — e.g. (1, 1) meaning 1-1 is most probable scoreline
+    most_likely_prob  — probability of that exact scoreline
+    home_position  — home team's current league table position
+    away_position  — away team's current league table position
+    """
+    home_prob:          float
+    draw_prob:          float
+    away_prob:          float
+    most_likely_score:  tuple   # (home_goals, away_goals)
+    most_likely_prob:   float
+    home_position:      int = 0
+    away_position:      int = 0
+
+    @property
+    def outcome(self) -> str:
+        """Most likely outcome label: Home Win | Draw | Away Win."""
+        m = max(self.home_prob, self.draw_prob, self.away_prob)
+        if m == self.home_prob:
+            return "Home Win"
+        if m == self.draw_prob:
+            return "Draw"
+        return "Away Win"
+
+    @property
+    def outcome_confidence(self) -> str:
+        """Confidence in the 1X2 call based on margin over the next outcome."""
+        m = max(self.home_prob, self.draw_prob, self.away_prob)
+        vals = sorted([self.home_prob, self.draw_prob, self.away_prob], reverse=True)
+        margin = vals[0] - vals[1]
+        if m >= 0.55 and margin >= 0.15:
+            return "high"
+        if m >= 0.42 and margin >= 0.08:
+            return "medium"
+        return "low"
+
+
+@dataclass(frozen=True)
 class TeamForm:
     """
     A team's form across their last FORM_WINDOW matches.
@@ -219,6 +263,7 @@ class ModelOutput:
     home_split: Optional[HomeAwaySplit] = None # home team's home-venue record
     away_split: Optional[HomeAwaySplit] = None # away team's away-venue record
     h2h: Optional[HeadToHead] = None           # head-to-head history
+    match_result: Optional["MatchResult"] = None  # 1X2 outcome probabilities
 
     # ── Derived properties ────────────────────────────────────────────────────
 
@@ -239,9 +284,28 @@ class ModelOutput:
 
     @property
     def confidence(self) -> ConfidenceLevel:
-        if self.over_prob >= 0.65 or self.under_prob >= 0.65:
+        # Over/Under signal
+        ou_high = self.over_prob >= 0.65 or self.under_prob >= 0.65
+        ou_med  = self.over_prob >= 0.55 or self.under_prob >= 0.55
+
+        # 1X2 signal (if available)
+        r = self.match_result
+        if r is not None:
+            mx = max(r.home_prob, r.draw_prob, r.away_prob)
+            vals = sorted([r.home_prob, r.draw_prob, r.away_prob], reverse=True)
+            margin = vals[0] - vals[1]
+            r_high = mx >= 0.55 and margin >= 0.15
+            r_med  = mx >= 0.42 and margin >= 0.08
+            # Both signals must agree on high/medium for that level to apply
+            if ou_high and r_high:
+                return ConfidenceLevel.HIGH
+            if ou_med or r_med:
+                return ConfidenceLevel.MEDIUM
+            return ConfidenceLevel.LOW
+
+        if ou_high:
             return ConfidenceLevel.HIGH
-        if self.over_prob >= 0.55 or self.under_prob >= 0.55:
+        if ou_med:
             return ConfidenceLevel.MEDIUM
         return ConfidenceLevel.LOW
 
