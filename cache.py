@@ -86,6 +86,33 @@ class DiskCache:
         except OSError as exc:
             logger.error("Cache write error for %s/%s: %s", source, key, exc)
 
+    def get_stale(self, source: str, key: str) -> Optional[Any]:
+        """
+        Return cached value even if expired — used for stale-while-revalidate.
+        Returns None only if no cache file exists at all.
+        """
+        data_path, meta_path = self._paths(source, key)
+        if not data_path.exists():
+            return None
+        try:
+            data = json.loads(data_path.read_text(encoding="utf-8"))
+            logger.debug("Stale cache hit: %s/%s", source, key)
+            return data
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Stale cache read error %s/%s: %s", source, key, exc)
+            return None
+
+    def age(self, source: str, key: str) -> Optional[float]:
+        """Return age of a cache entry in seconds, or None if it doesn't exist."""
+        _, meta_path = self._paths(source, key)
+        if not meta_path.exists():
+            return None
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            return time.time() - meta["written_at"]
+        except (json.JSONDecodeError, KeyError, OSError):
+            return None
+
     def invalidate(self, source: str, key: str) -> None:
         """Manually expire a single cache entry."""
         data_path, meta_path = self._paths(source, key)

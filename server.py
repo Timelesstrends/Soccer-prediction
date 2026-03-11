@@ -79,6 +79,21 @@ _predictions: List[ModelOutput] = []
 _last_updated: str = "Never"
 _lock = threading.Lock()
 
+# Phase status — broadcast to SSE clients so UI can show live progress
+# Keys: "phase" (1|2|done), "step" (human label), "leagues_done" (list)
+_phase_status: dict = {"phase": 0, "step": "Initialising...", "leagues_done": [], "stale": False}
+_status_lock = threading.Lock()
+
+def _set_status(phase: int, step: str, leagues_done: list = None, stale: bool = False) -> None:
+    global _phase_status
+    with _status_lock:
+        _phase_status = {
+            "phase":        phase,
+            "step":         step,
+            "leagues_done": leagues_done if leagues_done is not None else _phase_status["leagues_done"],
+            "stale":        stale,
+        }
+
 
 def update_predictions(predictions: List[ModelOutput]) -> None:
     """Thread-safe update of the shared prediction state."""
@@ -178,6 +193,13 @@ def _register_routes(app: Flask) -> None:
 
         def generate():
             sent_ids = set()
+            import json as _json
+
+            # Send current phase status immediately on connect
+            with _status_lock:
+                status = dict(_phase_status)
+            yield "event: phase\ndata: " + _json.dumps(status, ensure_ascii=True) + "\n\n"
+
             # Send whatever is already loaded immediately
             with _lock:
                 current = list(_predictions)
@@ -201,11 +223,19 @@ def _register_routes(app: Flask) -> None:
 
             # Keep watching for new predictions (form loading in Phase 2)
             import time
+            last_phase_sent = {}
             for _ in range(240):   # poll for up to ~4 minutes (240 x 1s)
                 time.sleep(1)
                 with _lock:
                     current = list(_predictions)
                     last    = _last_updated
+
+                # Emit phase status if it changed
+                with _status_lock:
+                    current_status = dict(_phase_status)
+                if current_status != last_phase_sent:
+                    yield "event: phase\ndata: " + _json.dumps(current_status, ensure_ascii=True) + "\n\n"
+                    last_phase_sent = current_status
 
                 new_preds = [p for p in current if p.match_id not in sent_ids]
                 updated   = [p for p in current if p.match_id in sent_ids
@@ -232,6 +262,10 @@ def _register_routes(app: Flask) -> None:
                         data = _serialise_prediction(pred)
                         yield "event: update\ndata: " + _json.dumps(data, ensure_ascii=True) + "\n\n"
 
+                # Stop polling once phase 3 (all done) is reached
+                if current_status.get("phase") == 3:
+                    break
+
             yield "event: done\ndata: {}\n\n"
 
         return Response(
@@ -249,6 +283,35 @@ def _register_routes(app: Flask) -> None:
         with _lock:
             count = len(_predictions)
         return jsonify({"status": "ok", "predictions_loaded": count})
+
+    @app.route("/api/status")
+    @requires_auth
+    def api_status() -> Response:
+        """Return current loading phase status for the UI progress overlay."""
+        with _status_lock:
+            status = dict(_phase_status)
+        with _lock:
+            count = len(_predictions)
+        status["predictions_loaded"] = count
+        return jsonify(status)
+
+    @app.route("/api/refresh/force")
+    @requires_auth
+    def api_refresh_force() -> Response:
+        """
+        Force a fresh data fetch by invalidating fixtures and odds cache,
+        then re-triggering Phase 1. Form/H2H cache is preserved (slow to refetch).
+        """
+        from cache import DiskCache
+        from config import FOOTBALL_DATA
+        cache = DiskCache()
+        # Only clear fixtures and odds — not form/H2H (too slow)
+        cache.clear_source("fixtures")
+        cache.clear_source("odds")
+        _set_status(0, "Manual refresh triggered...", [])
+        if os.getenv("LIVE_MODE", "").lower() == "true":
+            _start_live_mode(app)
+        return jsonify({"status": "ok", "message": "Cache cleared. Refresh started."})
 
     @app.route("/api/performance")
     @requires_auth
@@ -284,6 +347,11 @@ def _register_routes(app: Flask) -> None:
         except Exception as exc:
             return jsonify({"status": "error", "message": str(exc)}), 500
 
+    @app.route("/history")
+    @requires_auth
+    def history_page() -> str:
+        return render_template_string(HISTORY_TEMPLATE)
+
     @app.route("/favicon.ico")
     def favicon() -> Response:
         return Response(status=204)
@@ -312,82 +380,103 @@ def _start_live_mode(app: Flask) -> None:
     from client_odds_api import OddsAPIClient
     from scheduler import PredictionScheduler
     from config import FOOTBALL_DATA
+    from cache import DiskCache
 
     dashboard = PredictionDashboard(output_dir="predictions")
 
     def _initialise() -> None:
         football_client = FootballDataClient()
         odds_client     = OddsAPIClient()
+        cache           = DiskCache()
 
-        # ── Phase 1: strength + venue splits only (no form API calls) ─────
+        _set_status(1, "Checking cache for instant load...", [])
+
+        # ── Stale-while-revalidate: serve cached predictions immediately ──
+        # If we have any stale fixtures cached, build predictions from them
+        # right now so the browser gets data in <1s, then refresh in the background.
+        stale_predictions: List[ModelOutput] = []
+        from datetime import date, timedelta
+        today     = str(date.today())
+        tomorrow  = str(date.today() + timedelta(days=1))
+
+        for league_code in FOOTBALL_DATA.league_codes:
+            cache_key = f"{league_code}_{today}"
+            stale = cache.get_stale("fixtures", cache_key)
+            if stale:
+                try:
+                    standings = cache.get_stale("fixtures", f"standings_{league_code}")
+                    if standings and "total" in standings:
+                        strength_map = football_client._build_strength_map(standings["total"])
+                        home_map     = football_client._build_venue_split_map(standings["home"], "home")
+                        away_map     = football_client._build_venue_split_map(standings["away"], "away")
+                        pos_map      = football_client._build_position_map(standings["total"])
+                        for match in stale:
+                            try:
+                                stale_predictions.append(
+                                    football_client._match_to_output(
+                                        match, league_code, strength_map, home_map, away_map, pos_map
+                                    )
+                                )
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+
+        if stale_predictions:
+            try:
+                stale_predictions = odds_client.attach_value_bets(stale_predictions)
+            except Exception:
+                pass
+            update_predictions(stale_predictions)
+            _set_status(1, "Showing cached data \u2014 refreshing in background...", [], stale=True)
+            logger.info("Stale cache served: %d predictions shown instantly", len(stale_predictions))
+
+        # ── Phase 1: fresh fixtures + standings ───────────────────────────
+        _set_status(1, "Fetching live fixtures...", [])
         logger.info("Phase 1: fetching fixtures and standings...")
         all_predictions: List[ModelOutput] = []
+        leagues_done: List[str] = []
+
+        league_labels = {"PL": "Premier League", "PD": "La Liga", "BL1": "Bundesliga",
+                         "SA": "Serie A", "FL1": "Ligue 1"}
 
         for league_code in FOOTBALL_DATA.league_codes:
             try:
+                _set_status(1, f"Fetching {league_labels.get(league_code, league_code)}...", leagues_done[:])
                 matches   = football_client.get_matches(league_code)
                 standings = football_client.get_standings(league_code)
 
-                # standings is now {total, home, away} — use all three
                 strength_map = football_client._build_strength_map(standings["total"])
                 home_map     = football_client._build_venue_split_map(standings["home"], "home")
                 away_map     = football_client._build_venue_split_map(standings["away"], "away")
+                pos_map      = football_client._build_position_map(standings["total"])
 
                 for match in matches:
                     try:
-                        home_name = match["homeTeam"]["name"]
-                        away_name = match["awayTeam"]["name"]
-
-                        # Season strength signal
-                        hs = strength_map.get(home_name, 1.0)
-                        as_ = strength_map.get(away_name, 1.0)
-                        xg_season_home = hs * 1.35
-                        xg_season_away = as_ * 1.10
-
-                        # Venue split signal
-                        home_split = home_map.get(home_name)
-                        away_split = away_map.get(away_name)
-                        xg_venue_home = home_split.xg_estimate if home_split else xg_season_home
-                        xg_venue_away = away_split.xg_estimate if away_split else xg_season_away
-
-                        # Blend: 70% season, 30% venue (no form yet)
-                        xg_home = round(xg_season_home * 0.70 + xg_venue_home * 0.30, 2)
-                        xg_away = round(xg_season_away * 0.70 + xg_venue_away * 0.30, 2)
-                        xg_home = max(xg_home, 0.3)
-                        xg_away = max(xg_away, 0.3)
-
-                        pred = ModelOutput(
-                            match_id            = str(match["id"]),
-                            date                = match["utcDate"][:10],
-                            league              = match["competition"]["name"],
-                            home_team           = home_name,
-                            away_team           = away_name,
-                            expected_home_goals = xg_home,
-                            expected_away_goals = xg_away,
-                            home_strength       = hs,
-                            away_strength       = as_,
-                            goal_distribution   = football_client._poisson_distribution(xg_home + xg_away),
-                            home_split          = home_split,
-                            away_split          = away_split,
+                        all_predictions.append(
+                            football_client._match_to_output(
+                                match, league_code, strength_map, home_map, away_map, pos_map
+                            )
                         )
-                        all_predictions.append(pred)
                     except (KeyError, TypeError):
                         continue
 
+                leagues_done.append(league_labels.get(league_code, league_code))
+                _set_status(1, f"Loaded {league_labels.get(league_code, league_code)}", leagues_done[:])
                 logger.info("  Phase 1 %s: %d fixtures", league_code, len(matches))
             except Exception as exc:
                 logger.warning("  Phase 1 %s skipped — %s", league_code, exc)
 
-        # Attach odds before pushing to browser
+        _set_status(1, "Attaching odds...", leagues_done[:])
         try:
             all_predictions = odds_client.attach_value_bets(all_predictions)
         except Exception as exc:
             logger.warning("Odds skipped in Phase 1 — %s", exc)
 
         update_predictions(all_predictions)
+        _set_status(1, "Phase 1 complete", leagues_done[:], stale=False)
         logger.info("Phase 1 complete: %d matches visible in browser", len(all_predictions))
 
-        # Log Phase 1 predictions to DB (idempotent — skips existing match_ids)
         try:
             db.log_predictions_bulk(all_predictions)
         except Exception as exc:
@@ -395,19 +484,21 @@ def _start_live_mode(app: Flask) -> None:
 
         # ── Phase 2: full model per league (form + H2H) ───────────────────
         logger.info("Phase 2: fetching form + H2H (runs in background)...")
+        _set_status(2, "Fetching team form + H2H history...", [])
         phase2_all: List[ModelOutput] = []
+        p2_leagues_done: List[str] = []
 
         for league_code in FOOTBALL_DATA.league_codes:
             try:
-                # build_model_outputs fetches form + H2H using all 4 signals
+                _set_status(2, f"Form: {league_labels.get(league_code, league_code)}...", p2_leagues_done[:])
                 league_preds = football_client.build_model_outputs(league_code)
                 phase2_all.extend(league_preds)
+                p2_leagues_done.append(league_labels.get(league_code, league_code))
+                _set_status(2, f"Form loaded: {league_labels.get(league_code, league_code)}", p2_leagues_done[:])
                 logger.info("  Phase 2 done for %s (%d matches)", league_code, len(league_preds))
 
-                # Replace predictions for completed leagues immediately
-                # Keep Phase 1 predictions for leagues not yet processed
-                phase2_ids  = {p.match_id for p in phase2_all}
-                merged      = phase2_all + [
+                phase2_ids = {p.match_id for p in phase2_all}
+                merged     = phase2_all + [
                     p for p in all_predictions if p.match_id not in phase2_ids
                 ]
 
@@ -418,7 +509,6 @@ def _start_live_mode(app: Flask) -> None:
 
                 update_predictions(merged)
 
-                # Log the fully-blended Phase 2 predictions (updates existing rows)
                 try:
                     db.log_predictions_bulk(league_preds)
                 except Exception as exc:
@@ -427,6 +517,7 @@ def _start_live_mode(app: Flask) -> None:
             except Exception as exc:
                 logger.warning("  Phase 2 failed for %s — %s", league_code, exc)
 
+        _set_status(3, "All data loaded", p2_leagues_done[:])
         logger.info("Phase 2 complete: full model active for all leagues")
 
         # ── Start scheduler ───────────────────────────────────────────────
@@ -665,6 +756,21 @@ _predictions: List[ModelOutput] = []
 _last_updated: str = "Never"
 _lock = threading.Lock()
 
+# Phase status — broadcast to SSE clients so UI can show live progress
+# Keys: "phase" (1|2|done), "step" (human label), "leagues_done" (list)
+_phase_status: dict = {"phase": 0, "step": "Initialising...", "leagues_done": [], "stale": False}
+_status_lock = threading.Lock()
+
+def _set_status(phase: int, step: str, leagues_done: list = None, stale: bool = False) -> None:
+    global _phase_status
+    with _status_lock:
+        _phase_status = {
+            "phase":        phase,
+            "step":         step,
+            "leagues_done": leagues_done if leagues_done is not None else _phase_status["leagues_done"],
+            "stale":        stale,
+        }
+
 
 # ── Mock data (used without --live flag) ──────────────────────────────────────
 MOCK_PREDICTIONS = [
@@ -766,6 +872,14 @@ HTML_TEMPLATE = """
             max-width:1200px; margin:0 auto;
         }
         .hdr h1 { font-size:1.2rem; font-weight:700; }
+        .hdr-nav { display:flex; gap:.15rem; margin-left:1.2rem; }
+        .hdr-nav a {
+            font-size:.72rem; font-weight:600; padding:.28rem .7rem;
+            border-radius:6px; text-decoration:none; color:var(--t2);
+            transition:background .15s, color .15s;
+        }
+        .hdr-nav a:hover  { background:rgba(255,255,255,.07); color:var(--t1); }
+        .hdr-nav a.active { background:rgba(139,92,246,.18); color:#a78bfa; }
         .live-pill {
             display:inline-flex; align-items:center; gap:5px;
             background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3);
@@ -791,25 +905,65 @@ HTML_TEMPLATE = """
         .stat-label { font-size:0.58rem; text-transform:uppercase; letter-spacing:.07em; color:var(--t3); }
         .stat-num   { font-size:1.05rem; font-weight:700; }
 
-        /* ── Progress bar (shown while streaming) ── */
-        .progress-wrap {
-            max-width:1200px; margin:0.6rem auto 0;
-            padding:0 1.25rem;
-            display:none;
+        /* ── Loading overlay ── */
+        .load-overlay {
+            position:fixed; inset:0; z-index:999;
+            background:var(--bg);
+            display:flex; flex-direction:column;
+            align-items:center; justify-content:center;
+            gap:1.2rem; padding:2rem;
+            transition:opacity .4s ease;
         }
+        .load-overlay.fade-out { opacity:0; pointer-events:none; }
+        .load-overlay.hidden   { display:none; }
+        .load-spinner {
+            width:40px; height:40px;
+            border:3px solid rgba(139,92,246,.2);
+            border-top-color:#a78bfa;
+            border-radius:50%;
+            animation:spin .8s linear infinite;
+        }
+        @keyframes spin { to { transform:rotate(360deg); } }
+        .load-title  { font-size:1rem; font-weight:700; color:var(--t1); }
+        .load-step   { font-size:.78rem; color:var(--t2); min-height:1.2em; text-align:center; }
+        .load-bar-bg { width:260px; height:4px; background:rgba(255,255,255,.08); border-radius:2px; overflow:hidden; }
+        .load-bar-fill { height:100%; width:0%; background:linear-gradient(90deg,#6366f1,#a78bfa); border-radius:2px; transition:width .4s ease; }
+        .load-leagues { display:flex; flex-wrap:wrap; gap:.4rem; justify-content:center; max-width:320px; }
+        .load-league  { font-size:.65rem; padding:.18rem .45rem; border-radius:4px; background:rgba(255,255,255,.06); color:var(--t3); transition:all .3s; }
+        .load-league.done { background:rgba(16,185,129,.15); color:var(--green); }
+        .load-stale   { font-size:.68rem; color:var(--yellow); display:flex; align-items:center; gap:.3rem; }
+
+        /* ── Inline progress bar (shown under header while phase 2 runs) ── */
+        .progress-wrap { max-width:1200px; margin:0.6rem auto 0; padding:0 1.25rem; display:none; }
         .progress-wrap.show { display:block; }
-        .progress-bg {
-            height:3px; background:rgba(255,255,255,0.07);
-            border-radius:2px; overflow:hidden;
+        .progress-bg   { height:3px; background:rgba(255,255,255,0.07); border-radius:2px; overflow:hidden; }
+        .progress-fill { height:100%; width:0%; background:linear-gradient(90deg,var(--blue),var(--green)); border-radius:2px; transition:width 0.3s ease; }
+        .progress-label { font-size:0.62rem; color:var(--t3); margin-top:3px; text-align:right; }
+
+        /* ── Skeleton cards ── */
+        .skeleton { animation:shimmer 1.6s ease-in-out infinite; }
+        @keyframes shimmer {
+            0%,100% { opacity:.45; }
+            50%      { opacity:.15; }
         }
-        .progress-fill {
-            height:100%; width:0%;
-            background:linear-gradient(90deg,var(--blue),var(--green));
-            border-radius:2px; transition:width 0.3s ease;
+        .skel-card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:1rem; height:140px; }
+
+        /* ── Refresh button ── */
+        .refresh-btn {
+            background:rgba(139,92,246,.12); border:1px solid rgba(139,92,246,.3);
+            color:#a78bfa; padding:.22rem .65rem; border-radius:6px;
+            font-size:.68rem; font-weight:600; cursor:pointer;
+            transition:all .15s; white-space:nowrap;
         }
-        .progress-label {
-            font-size:0.62rem; color:var(--t3); margin-top:3px; text-align:right;
+        .refresh-btn:hover { background:rgba(139,92,246,.22); }
+        .refresh-btn:disabled { opacity:.4; cursor:default; }
+        .stale-banner {
+            max-width:1200px; margin:.5rem auto 0; padding:.35rem 1rem;
+            background:rgba(245,158,11,.08); border:1px solid rgba(245,158,11,.2);
+            border-radius:6px; font-size:.7rem; color:var(--yellow);
+            display:none; align-items:center; gap:.5rem;
         }
+        .stale-banner.show { display:flex; }
 
         /* ── Filter bar ── */
         .filter-bar {
@@ -974,13 +1128,40 @@ HTML_TEMPLATE = """
 </head>
 <body>
 
+<!-- ── Loading overlay (hidden once first data arrives) ── -->
+<div class="load-overlay" id="load-overlay">
+    <div class="load-spinner"></div>
+    <div class="load-title">Soccer Predictions</div>
+    <div class="load-step" id="load-step">Connecting...</div>
+    <div class="load-bar-bg"><div class="load-bar-fill" id="load-bar"></div></div>
+    <div class="load-leagues" id="load-leagues">
+        <span class="load-league" id="ll-PL">PL</span>
+        <span class="load-league" id="ll-PD">La Liga</span>
+        <span class="load-league" id="ll-BL1">Buli</span>
+        <span class="load-league" id="ll-SA">SA</span>
+        <span class="load-league" id="ll-FL1">L1</span>
+    </div>
+</div>
+
 <div class="hdr">
     <div class="hdr-row">
-        <h1>&#x26BD; Soccer Predictions</h1>
-        <div class="live-pill">
-            <div class="pulse"></div>
-            <span id="status-text">Connecting...</span>
+        <div style="display:flex;align-items:center;gap:.5rem;">
+            <h1>&#x26BD; Soccer Predictions</h1>
+            <nav class="hdr-nav">
+                <a href="/" class="active">Fixtures</a>
+                <a href="/history">History</a>
+            </nav>
         </div>
+        <div style="display:flex;align-items:center;gap:.6rem;">
+            <button class="refresh-btn" id="refresh-btn" onclick="forceRefresh()" title="Force fresh data fetch">&#x21BB; Refresh</button>
+            <div class="live-pill">
+                <div class="pulse"></div>
+                <span id="status-text">Connecting...</span>
+            </div>
+        </div>
+    </div>
+    <div class="stale-banner" id="stale-banner">
+        &#x26A0; Showing cached data from a previous session &mdash; refreshing in background...
     </div>
     <div class="stats-strip" id="stats-strip"></div>
     <div class="progress-wrap" id="progress-wrap">
@@ -1000,12 +1181,117 @@ HTML_TEMPLATE = """
 (function() {
 
     /* ── State ─────────────────────────────────────────────────────────── */
-    var ALL    = {};          // match_id -> prediction object
+    var ALL    = {};
     var LEAGUE = 'all';
     var DATE   = 'all';
     var CONF   = 'all';
     var VONLY  = false;
-    var TOTAL_EXPECTED = 0;  // rough count for progress bar
+    var TOTAL_EXPECTED = 0;
+    var _overlayDismissed = false;
+
+    /* ── Loading overlay helpers ─────────────────────────────────────────── */
+    var LEAGUE_LABELS = {
+        'Premier League': 'll-PL',
+        'La Liga':        'll-PD',
+        'Bundesliga':     'll-BL1',
+        'Serie A':        'll-SA',
+        'Ligue 1':        'll-FL1',
+    };
+    var PHASE_BARS = { 0: 5, 1: 40, 2: 80, 3: 100 };
+
+    function handlePhase(s) {
+        var step   = document.getElementById('load-step');
+        var bar    = document.getElementById('load-bar');
+        var banner = document.getElementById('stale-banner');
+        var pbar   = document.getElementById('progress-wrap');
+        var pfill  = document.getElementById('progress-fill');
+        var plabel = document.getElementById('progress-label');
+
+        if (step)  step.textContent = s.step || '';
+        if (bar)   bar.style.width  = (PHASE_BARS[s.phase] || 5) + '%';
+
+        /* Mark league badges done */
+        var done = s.leagues_done || [];
+        done.forEach(function(lgName) {
+            var id = LEAGUE_LABELS[lgName];
+            if (id) {
+                var el = document.getElementById(id);
+                if (el) el.classList.add('done');
+            }
+        });
+
+        /* Stale banner */
+        if (banner) {
+            if (s.stale) banner.classList.add('show');
+            else         banner.classList.remove('show');
+        }
+
+        /* Phase 2 inline progress bar */
+        if (s.phase === 2 && pbar && pfill) {
+            pbar.classList.add('show');
+            var p2pct = done.length ? Math.round((done.length / 5) * 100) : 5;
+            pfill.style.width = p2pct + '%';
+            if (plabel) plabel.textContent = 'Loading form + H2H... ' + done.length + '/5 leagues';
+        }
+
+        /* Dismiss overlay once first real data is visible */
+        if (!_overlayDismissed && Object.keys(ALL).length > 0) {
+            dismissOverlay();
+        }
+
+        /* Phase 3 = all done */
+        if (s.phase === 3) {
+            dismissOverlay();
+            if (pbar) {
+                pfill.style.width = '100%';
+                setTimeout(function(){ pbar.classList.remove('show'); }, 1500);
+            }
+            var rbtn = document.getElementById('refresh-btn');
+            if (rbtn) rbtn.disabled = false;
+        }
+    }
+
+    function dismissOverlay() {
+        if (_overlayDismissed) return;
+        _overlayDismissed = true;
+        var ov = document.getElementById('load-overlay');
+        if (!ov) return;
+        ov.classList.add('fade-out');
+        setTimeout(function(){ ov.classList.add('hidden'); }, 450);
+    }
+
+    function showSkeletons(count) {
+        var grid = document.getElementById('grid');
+        if (!grid || grid.children.length > 0) return;
+        var html = '';
+        for (var i = 0; i < (count || 6); i++) {
+            html += '<div class="skel-card skeleton"></div>';
+        }
+        grid.innerHTML = html;
+    }
+
+    function forceRefresh() {
+        var btn = document.getElementById('refresh-btn');
+        if (btn) btn.disabled = true;
+        _overlayDismissed = false;
+        var ov = document.getElementById('load-overlay');
+        if (ov) { ov.classList.remove('fade-out','hidden'); }
+        var step = document.getElementById('load-step');
+        if (step) step.textContent = 'Refreshing data...';
+        ALL = {};
+        var grid = document.getElementById('grid');
+        if (grid) grid.innerHTML = '';
+        showSkeletons(6);
+        fetch('/api/refresh/force')
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+                if (d.status === 'ok') startStream();
+            })
+            .catch(function(){
+                if (btn) btn.disabled = false;
+                dismissOverlay();
+            });
+    }
 
     var LEAGUE_ABBR = {
         'Premier League': 'PL',
@@ -1492,20 +1778,30 @@ HTML_TEMPLATE = """
     /* ── SSE stream ─────────────────────────────────────────────────────── */
     function startStream() {
         if (!window.EventSource) {
-            /* Fallback for browsers without SSE support */
             fallbackFetch();
             return;
         }
 
         var src = new EventSource('/api/stream');
 
+        src.addEventListener('phase', function(e) {
+            try { handlePhase(JSON.parse(e.data)); }
+            catch(err) { console.error('stream phase err', err); }
+        });
+
         src.addEventListener('match', function(e) {
             try {
                 var p = JSON.parse(e.data);
+                /* First real card — clear skeletons and dismiss overlay */
+                if (Object.keys(ALL).length === 0) {
+                    var grid = document.getElementById('grid');
+                    if (grid) grid.innerHTML = '';
+                    dismissOverlay();
+                }
                 ALL[p.match_id] = p;
                 appendCard(p);
-                scheduleFilterBar();        /* throttled — not on every single match */
-                renderStats(null);          /* recompute from ALL immediately */
+                scheduleFilterBar();
+                renderStats(null);
                 var cnt = Object.keys(ALL).length;
                 showProgress(cnt, Math.max(cnt, TOTAL_EXPECTED));
             } catch(err) { console.error('stream match err', err); }
@@ -1515,7 +1811,6 @@ HTML_TEMPLATE = """
             try {
                 var p = JSON.parse(e.data);
                 ALL[p.match_id] = p;
-                /* Re-render card in place to add form badges */
                 appendCard(p);
             } catch(err) { console.error('stream update err', err); }
         });
@@ -1524,7 +1819,7 @@ HTML_TEMPLATE = """
             try {
                 var s = JSON.parse(e.data);
                 TOTAL_EXPECTED = s.total || 0;
-                renderStats(null);          /* always compute from ALL for accuracy */
+                renderStats(null);
                 buildFilterBar();
                 var cnt = Object.keys(ALL).length;
                 showProgress(cnt, TOTAL_EXPECTED);
@@ -1538,14 +1833,16 @@ HTML_TEMPLATE = """
 
         src.addEventListener('done', function() {
             src.close();
+            dismissOverlay();
             showProgress(100, 100);
-            /* Switch to polling now that stream is done */
+            var rbtn = document.getElementById('refresh-btn');
+            if (rbtn) rbtn.disabled = false;
             setInterval(fallbackFetch, 30000);
         });
 
         src.onerror = function() {
             src.close();
-            console.log('SSE closed, switching to polling');
+            dismissOverlay();
             fallbackFetch();
             setInterval(fallbackFetch, 30000);
         };
@@ -1556,6 +1853,12 @@ HTML_TEMPLATE = """
             .then(function(r){ return r.json(); })
             .then(function(d){
                 var i;
+                /* Clear skeletons on first real data */
+                if (Object.keys(ALL).length === 0) {
+                    var grid = document.getElementById('grid');
+                    if (grid) grid.innerHTML = '';
+                    dismissOverlay();
+                }
                 for (i = 0; i < d.predictions.length; i++) {
                     ALL[d.predictions[i].match_id] = d.predictions[i];
                 }
@@ -1571,6 +1874,7 @@ HTML_TEMPLATE = """
     }
 
     /* ── Boot ───────────────────────────────────────────────────────────── */
+    showSkeletons(10);   /* show skeleton cards immediately while connecting */
     startStream();
 
 })();
@@ -1578,6 +1882,328 @@ HTML_TEMPLATE = """
 </body>
 </html>
 """
+
+# ── History page template ─────────────────────────────────────────────────────
+
+HISTORY_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Match History \u2014 Soccer Predictions</title>
+    <style>
+        :root { --bg:#090e1a; --card:#101825; --border:rgba(255,255,255,0.07); --t1:#f0f4f8; --t2:#7a8fa6; --t3:#3d5068; --green:#10b981; --yellow:#f59e0b; --red:#ef4444; --purple:#a78bfa; }
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { font-family:-apple-system,'Segoe UI',system-ui,sans-serif; background:var(--bg); color:var(--t1); min-height:100vh; }
+        .hdr { background:linear-gradient(160deg,#0d1a35,#131b30,#1a1040); border-bottom:1px solid rgba(139,92,246,0.2); padding:.9rem 1.25rem 0; position:sticky; top:0; z-index:200; box-shadow:0 4px 24px rgba(0,0,0,0.5); }
+        .hdr-row { display:flex; align-items:center; justify-content:space-between; max-width:1200px; margin:0 auto; padding-bottom:.6rem; }
+        .hdr-row h1 { font-size:1.2rem; font-weight:700; }
+        .hdr-nav { display:flex; gap:.15rem; margin-left:1.2rem; }
+        .hdr-nav a { font-size:.72rem; font-weight:600; padding:.28rem .7rem; border-radius:6px; text-decoration:none; color:var(--t2); transition:background .15s,color .15s; }
+        .hdr-nav a:hover { background:rgba(255,255,255,.07); color:var(--t1); }
+        .hdr-nav a.active { background:rgba(139,92,246,.18); color:var(--purple); }
+        .acc-strip { display:flex; max-width:1200px; margin:0 auto; border-top:1px solid var(--border); }
+        .acc-pill { flex:1; text-align:center; padding:.4rem .25rem; border-right:1px solid var(--border); }
+        .acc-pill:last-child { border-right:none; }
+        .acc-label { font-size:.58rem; text-transform:uppercase; letter-spacing:.07em; color:var(--t3); }
+        .acc-num { font-size:1.05rem; font-weight:700; }
+        .acc-num.positive { color:var(--green); }
+        .acc-num.negative { color:var(--red); }
+        .page-wrap { max-width:1200px; margin:0 auto; padding:1rem 1rem 3rem; }
+        .filter-bar { display:flex; flex-wrap:wrap; gap:.4rem; align-items:center; margin-bottom:1rem; }
+        .fsep { width:1px; height:20px; background:var(--border); flex-shrink:0; }
+        .filter-group { display:flex; flex-wrap:wrap; gap:.4rem; }
+        .fbtn { background:rgba(255,255,255,.05); border:1px solid var(--border); color:var(--t2); padding:.28rem .65rem; border-radius:6px; font-size:.7rem; font-weight:600; cursor:pointer; transition:all .15s; }
+        .fbtn:hover { background:rgba(255,255,255,.09); color:var(--t1); }
+        .fbtn.active { background:rgba(139,92,246,.18); border-color:rgba(139,92,246,.4); color:var(--purple); }
+        .count-tag { font-size:.68rem; color:var(--t3); margin-left:.25rem; }
+        .breakdown-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:.65rem; margin-bottom:1.5rem; }
+        .bk-card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:.7rem .85rem; }
+        .bk-title { font-size:.63rem; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:var(--t3); margin-bottom:.4rem; }
+        .bk-stat { font-size:.73rem; color:var(--t2); margin-bottom:.18rem; }
+        .bk-stat span { font-weight:700; color:var(--t1); }
+        .bk-acc { font-size:1.05rem; font-weight:800; margin-top:.35rem; }
+        .bk-acc.good { color:var(--green); }
+        .bk-acc.ok { color:var(--yellow); }
+        .bk-acc.bad { color:var(--red); }
+        .hist-table { width:100%; border-collapse:collapse; font-size:.72rem; }
+        .hist-table th { text-align:left; padding:.45rem .6rem; border-bottom:2px solid var(--border); color:var(--t3); font-size:.6rem; text-transform:uppercase; letter-spacing:.06em; font-weight:600; white-space:nowrap; }
+        .hist-table td { padding:.5rem .6rem; border-bottom:1px solid var(--border); vertical-align:middle; }
+        .hist-table tr:hover td { background:rgba(255,255,255,.025); }
+        .match-teams { font-weight:600; font-size:.74rem; }
+        .match-meta { font-size:.62rem; color:var(--t3); margin-top:.1rem; }
+        .score-cell { font-weight:800; font-size:.9rem; text-align:center; white-space:nowrap; }
+        .pred-cell { text-align:center; }
+        .pred-goals { font-size:.78rem; font-weight:700; }
+        .pred-ou { font-size:.62rem; color:var(--t3); }
+        .pred-vb { font-size:.62rem; color:var(--green); margin-top:.1rem; }
+        .outcome-badge { display:inline-flex; align-items:center; gap:.3rem; padding:.2rem .5rem; border-radius:5px; font-size:.65rem; font-weight:700; white-space:nowrap; }
+        .badge-correct { background:rgba(16,185,129,.15); color:var(--green); border:1px solid rgba(16,185,129,.25); }
+        .badge-wrong { background:rgba(239,68,68,.12); color:var(--red); border:1px solid rgba(239,68,68,.2); }
+        .badge-pending { background:rgba(100,116,139,.12); color:var(--t3); border:1px solid var(--border); }
+        .conf-tag { display:inline-block; padding:.15rem .4rem; border-radius:4px; font-size:.6rem; font-weight:700; }
+        .tag-high { background:rgba(16,185,129,.15); color:var(--green); }
+        .tag-medium { background:rgba(245,158,11,.12); color:var(--yellow); }
+        .tag-low { background:rgba(100,116,139,.12); color:var(--t3); }
+        .pnl-cell { text-align:right; font-weight:700; font-size:.78rem; white-space:nowrap; }
+        .pnl-pos { color:var(--green); }
+        .pnl-neg { color:var(--red); }
+        .pnl-nil { color:var(--t3); }
+        .no-results { text-align:center; padding:3.5rem 1rem; color:var(--t2); }
+        .no-results-icon { font-size:2.5rem; margin-bottom:.6rem; }
+        .no-results p { margin-bottom:.3rem; }
+        .no-results .hint { font-size:.78rem; color:var(--t3); }
+        @media(max-width:700px){
+            .hist-table th:nth-child(4),.hist-table td:nth-child(4),
+            .hist-table th:nth-child(6),.hist-table td:nth-child(6) { display:none; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="hdr">
+    <div class="hdr-row">
+        <div style="display:flex;align-items:center;gap:.5rem;">
+            <h1>&#x26BD; Soccer Predictions</h1>
+            <nav class="hdr-nav">
+                <a href="/">Fixtures</a>
+                <a href="/history" class="active">History</a>
+            </nav>
+        </div>
+    </div>
+    <div class="acc-strip">
+        <div class="acc-pill"><div class="acc-label">Resolved</div><div class="acc-num" id="s-total">&#x2014;</div></div>
+        <div class="acc-pill"><div class="acc-label">O/U Accuracy</div><div class="acc-num" id="s-accuracy">&#x2014;</div></div>
+        <div class="acc-pill"><div class="acc-label">Value Bets</div><div class="acc-num" id="s-vbwon">&#x2014;</div></div>
+        <div class="acc-pill"><div class="acc-label">P&amp;L</div><div class="acc-num" id="s-pnl">&#x2014;</div></div>
+        <div class="acc-pill"><div class="acc-label">ROI</div><div class="acc-num" id="s-roi">&#x2014;</div></div>
+    </div>
+</div>
+
+<div class="page-wrap">
+
+    <div class="filter-bar" id="filter-bar">
+        <div class="filter-group" id="grp-outcome">
+            <button class="fbtn active" data-filter="outcome" data-val="all">All Results</button>
+            <button class="fbtn" data-filter="outcome" data-val="correct">&#x2705; Correct</button>
+            <button class="fbtn" data-filter="outcome" data-val="wrong">&#x274C; Wrong</button>
+        </div>
+        <div class="fsep"></div>
+        <div class="filter-group" id="grp-conf">
+            <button class="fbtn active" data-filter="conf" data-val="all">All Conf</button>
+            <button class="fbtn" data-filter="conf" data-val="high">&#x1F7E2; High</button>
+            <button class="fbtn" data-filter="conf" data-val="medium">&#x1F7E1; Med</button>
+            <button class="fbtn" data-filter="conf" data-val="low">&#x1F534; Low</button>
+        </div>
+        <div class="fsep"></div>
+        <div class="filter-group" id="grp-league"></div>
+        <span class="count-tag" id="count-tag"></span>
+    </div>
+
+    <div class="breakdown-grid" id="breakdown-grid"></div>
+
+    <table class="hist-table">
+        <thead>
+            <tr>
+                <th>Match</th>
+                <th style="text-align:center">Score</th>
+                <th style="text-align:center">Predicted</th>
+                <th style="text-align:center">Confidence</th>
+                <th style="text-align:center">Outcome</th>
+                <th style="text-align:right">P&amp;L</th>
+            </tr>
+        </thead>
+        <tbody id="hist-body"></tbody>
+    </table>
+
+    <div class="no-results" id="no-results" style="display:none">
+        <div class="no-results-icon">&#x1F4CA;</div>
+        <p>No resolved matches yet.</p>
+        <p class="hint">Results appear here automatically after matches finish. Check back tomorrow!</p>
+    </div>
+
+</div>
+
+<script>
+(function() {
+    var ALL      = [];
+    var FOUTCOME = 'all';
+    var FCONF    = 'all';
+    var FLEAGUE  = 'all';
+
+    function esc(s) {
+        return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+    function sf(v, d) { var n=parseFloat(v); return isNaN(n)?'?':n.toFixed(d); }
+    function pct(v)   { return sf((v||0)*100,1)+'%'; }
+    function lgAbbr(n) {
+        var m={'Premier League':'PL','La Liga':'LaLiga','Bundesliga':'Buli','Serie A':'SA','Ligue 1':'L1'};
+        return m[n]||(n||'').substring(0,5);
+    }
+    function fmtDate(s) {
+        if (!s) return '';
+        var d = new Date(s+'T12:00:00Z');
+        return d.toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'});
+    }
+
+    function loadData() {
+        fetch('/api/results/recent')
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+                ALL = d.results || [];
+                buildLeagueBtns();
+                render();
+            })
+            .catch(function(){ showMsg('Could not load history data.'); });
+
+        fetch('/api/performance')
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+                renderStats(d.performance||{});
+                renderBreakdown(d.performance||{});
+            })
+            .catch(function(){});
+    }
+
+    function renderStats(perf) {
+        var ov  = perf.overall || {};
+        var pnl = ov.total_pnl || 0;
+        var roi = ov.roi || 0;
+        document.getElementById('s-total').textContent    = ov.total_results || 0;
+        document.getElementById('s-accuracy').textContent = pct(ov.over_under_accuracy||0);
+        document.getElementById('s-vbwon').textContent    = (ov.value_bets_won||0)+' / '+(ov.value_bets_total||0);
+        var pEl = document.getElementById('s-pnl');
+        pEl.textContent = (pnl>=0?'+':'')+sf(pnl,2)+'u';
+        pEl.className   = 'acc-num'+(pnl>0?' positive':pnl<0?' negative':'');
+        var rEl = document.getElementById('s-roi');
+        rEl.textContent = (roi>=0?'+':'')+sf(roi,1)+'%';
+        rEl.className   = 'acc-num'+(roi>0?' positive':roi<0?' negative':'');
+    }
+
+    function renderBreakdown(perf) {
+        var html = '';
+        function card(title, e) {
+            if (!e||!e.total_results) return '';
+            var acc = (e.over_under_accuracy||0)*100;
+            var cls = acc>=60?'good':acc>=50?'ok':'bad';
+            var pnl = e.total_pnl||0;
+            return '<div class="bk-card">'+
+                '<div class="bk-title">'+esc(title)+'</div>'+
+                '<div class="bk-stat">Matches: <span>'+e.total_results+'</span></div>'+
+                (e.value_bets_total?'<div class="bk-stat">Value bets: <span>'+(e.value_bets_won||0)+'/'+e.value_bets_total+'</span></div>':'')+
+                '<div class="bk-stat">P&amp;L: <span style="color:'+(pnl>=0?'var(--green)':'var(--red)')+'">'+
+                    (pnl>=0?'+':'')+sf(pnl,2)+'u</span></div>'+
+                '<div class="bk-acc '+cls+'">'+sf(acc,1)+'% O/U acc</div>'+
+            '</div>';
+        }
+        var bc = perf.by_confidence||{};
+        ['high','medium','low'].forEach(function(c){
+            html += card(c.charAt(0).toUpperCase()+c.slice(1)+' Conf', bc[c]);
+        });
+        var bl = perf.by_league||{};
+        Object.keys(bl).forEach(function(l){ html += card(l, bl[l]); });
+        document.getElementById('breakdown-grid').innerHTML = html;
+    }
+
+    function buildLeagueBtns() {
+        var seen = {};
+        ALL.forEach(function(r){ if(r.league) seen[r.league]=true; });
+        var grp  = document.getElementById('grp-league');
+        var html = '<button class="fbtn active" data-filter="league" data-val="all">All Leagues</button>';
+        Object.keys(seen).forEach(function(lg){
+            html += '<button class="fbtn" data-filter="league" data-val="'+esc(lg)+'">'+lgAbbr(lg)+'</button>';
+        });
+        grp.innerHTML = html;
+        grp.querySelectorAll('.fbtn').forEach(function(b){
+            b.addEventListener('click', function(){
+                FLEAGUE = this.getAttribute('data-val');
+                grp.querySelectorAll('.fbtn').forEach(function(x){ x.classList.remove('active'); });
+                this.classList.add('active');
+                render();
+            });
+        });
+    }
+
+    function getFiltered() {
+        return ALL.filter(function(r){
+            if (FOUTCOME==='correct' && r.predicted_correct!==1) return false;
+            if (FOUTCOME==='wrong'   && r.predicted_correct!==0) return false;
+            if (FCONF!=='all' && r.confidence!==FCONF) return false;
+            if (FLEAGUE!=='all' && r.league!==FLEAGUE) return false;
+            return true;
+        });
+    }
+
+    function render() {
+        var rows   = getFiltered();
+        var body   = document.getElementById('hist-body');
+        var noRes  = document.getElementById('no-results');
+        var ctEl   = document.getElementById('count-tag');
+        ctEl.textContent = rows.length+' of '+ALL.length+' shown';
+        if (!rows.length) { body.innerHTML=''; noRes.style.display=''; return; }
+        noRes.style.display = 'none';
+        body.innerHTML = rows.map(buildRow).join('');
+    }
+
+    function buildRow(r) {
+        var over  = parseFloat(r.over_prob)||0;
+        var under = parseFloat(r.under_prob)||0;
+        var ouLbl = over>under ? 'Over 2.5 ('+pct(over)+')' : 'Under 2.5 ('+pct(under)+')';
+        var conf  = r.confidence||'low';
+        var score = (r.home_goals!==null&&r.home_goals!==undefined)
+            ? r.home_goals+' &ndash; '+r.away_goals : '&#x2014;';
+        var outHtml = r.predicted_correct===1
+            ? '<span class="outcome-badge badge-correct">&#x2705; Correct</span>'
+            : r.predicted_correct===0
+                ? '<span class="outcome-badge badge-wrong">&#x274C; Wrong</span>'
+                : '<span class="outcome-badge badge-pending">&#x23F3; Pending</span>';
+        var pnl    = (r.pnl!==null&&r.pnl!==undefined) ? parseFloat(r.pnl) : null;
+        var pnlCls = pnl>0?'pnl-pos':pnl<0?'pnl-neg':'pnl-nil';
+        var pnlTxt = (r.value_rec&&pnl!==null)
+            ? (pnl>=0?'+':'')+sf(pnl,2)+'u'
+            : '<span style="color:var(--t3)">&#x2014;</span>';
+
+        return '<tr>'+
+            '<td><div class="match-teams">'+esc(r.home_team)+' vs '+esc(r.away_team)+'</div>'+
+                '<div class="match-meta">'+lgAbbr(r.league)+' &middot; '+fmtDate(r.match_date)+'</div></td>'+
+            '<td><div class="score-cell">'+score+'</div></td>'+
+            '<td><div class="pred-cell">'+
+                '<div class="pred-goals">'+sf(r.predicted_goals,1)+' goals</div>'+
+                '<div class="pred-ou">'+ouLbl+'</div>'+
+                (r.value_rec?'<div class="pred-vb">&#x1F4B0; Value bet</div>':'')+
+            '</div></td>'+
+            '<td style="text-align:center"><span class="conf-tag tag-'+conf+'">'+conf+'</span></td>'+
+            '<td style="text-align:center">'+outHtml+'</td>'+
+            '<td><div class="pnl-cell '+pnlCls+'">'+pnlTxt+'</div></td>'+
+        '</tr>';
+    }
+
+    function showMsg(msg) {
+        var el = document.getElementById('no-results');
+        el.style.display = '';
+        el.innerHTML = '<div class="no-results-icon">&#x26A0;&#xFE0F;</div><p>'+esc(msg)+'</p>';
+    }
+
+    document.getElementById('filter-bar').addEventListener('click', function(e){
+        var btn = e.target.closest('.fbtn[data-filter]');
+        if (!btn) return;
+        var f = btn.getAttribute('data-filter');
+        var v = btn.getAttribute('data-val');
+        btn.closest('.filter-group').querySelectorAll('.fbtn').forEach(function(b){ b.classList.remove('active'); });
+        btn.classList.add('active');
+        if (f==='outcome') FOUTCOME=v;
+        if (f==='conf')    FCONF=v;
+        render();
+    });
+
+    loadData();
+})();
+</script>
+</body>
+</html>
+"""
+
 # ── Local development entry point ────────────────────────────────────────────
 # Gunicorn calls create_app() directly — this block is only for
 # running locally via: python server.py [--live]
